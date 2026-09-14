@@ -34,7 +34,10 @@ class TemporalQuery:
         Returns a list of change records sorted by updated_at descending.
         """
         since = datetime.now(timezone.utc) - timedelta(days=days_ago)
-        nodes = self._graph.find_nodes(entity_type=entity_type, since=since)
+        nodes = [
+            n for n in self._graph.find_nodes(entity_type=entity_type)
+            if n.updated_at >= since
+        ]
         records = []
         for node in nodes:
             records.append({
@@ -126,7 +129,10 @@ class TemporalQuery:
         within the last ``days_ago`` days.
         """
         since = datetime.now(timezone.utc) - timedelta(days=days_ago)
-        nodes = self._graph.find_nodes(label_contains=topic, since=since)
+        nodes = [
+            n for n in self._graph.find_nodes(label_contains=topic)
+            if n.updated_at >= since
+        ]
         return [
             {
                 "node_id": n.node_id,

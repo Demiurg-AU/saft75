@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
 from .state_manager import StateManager, WorkflowState
 from .error_handler import ErrorHandler, RetryConfig
@@ -137,8 +137,9 @@ class WorkflowEngine:
             raise RuntimeError("No start node defined. Add a node with NodeType.START.")
 
         current = self._start_node
-        visited: Set[str] = set()
+        visit_counts: Dict[str, int] = {}
         step_count = 0
+        cycle_limit = max(len(self._nodes), 1)
 
         while current and step_count < self._max_steps:
             node = self._nodes.get(current)
@@ -152,12 +153,14 @@ class WorkflowEngine:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
 
-            # Detect infinite loops
-            step_key = f"{current}:{step_count}"
-            if step_key in visited and node.node_type != NodeType.END:
-                context["_workflow"]["errors"].append(f"Cycle detected at node '{current}'")
+            # Detect infinite loops: a node revisited more times than there
+            # are nodes in the graph is very unlikely to be making progress.
+            visit_counts[current] = visit_counts.get(current, 0) + 1
+            if visit_counts[current] > cycle_limit and node.node_type != NodeType.END:
+                context["_workflow"]["errors"].append(
+                    f"Cycle detected at node '{current}' (visited {visit_counts[current]} times)"
+                )
                 break
-            visited.add(step_key)
 
             # Persist state checkpoint
             self._state_manager.save_state(
