@@ -2,9 +2,24 @@
 PyTorch INT8 and INT4 quantization for production edge deployment.
 
 Implements:
-- Dynamic INT8 quantization (no calibration data needed)
-- Static INT8 quantization (with calibration)
-- INT4 weight-only quantization (via manual rounding)
+- Dynamic INT8 quantization (no calibration data needed) — via torchao's
+  ``quantize_()`` API, since ``torch.ao.quantization.quantize_dynamic`` is
+  deprecated upstream and slated for removal.
+- Static INT8 quantization (with calibration) — via the legacy
+  ``torch.ao.quantization`` eager-mode API. Still functional but
+  deprecated upstream; not yet migrated to torchao's PT2E flow
+  (``prepare_pt2e``/``convert_pt2e``), which needs an observer-based
+  ``Quantizer`` and a ``torch.export``-captured graph rather than a
+  drop-in config swap.
+- INT4 weight-only quantization (via manual rounding) — kept as a
+  CPU-only simulation. torchao's real INT4 tensor formats
+  (``Int4WeightOnlyConfig``) all require either a CUDA GPU or the
+  GPU-only ``mslk`` package on this platform/version (verified against
+  torchao 0.18.0 on x86_64 Linux CPU: ``plain`` and ``preshuffled``
+  raise "Requires mslk >= 1.0.0", ``plain_int32`` raises
+  "does not support device 'cpu' yet", and ``tile_packed_to_4d``
+  requires a CUDA driver). There is no portable real INT4 kernel path
+  for this library's CPU-first CI, so this method stays as-is.
 """
 from __future__ import annotations
 
@@ -19,6 +34,12 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+try:
+    from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfig
+    HAS_TORCHAO = True
+except ImportError:
+    HAS_TORCHAO = False
 
 
 @dataclass
@@ -151,19 +172,19 @@ class RealQuantizer:
 
     def _dynamic_int8(self, model: "nn.Module") -> "nn.Module":
         """
-        Dynamic INT8 quantization — weights quantized ahead of time,
-        activations quantized dynamically at inference.
-        No calibration data required.
+        Dynamic INT8 quantization via torchao — per-channel int8 weights,
+        with activations quantized dynamically at inference. No
+        calibration data required. Targets ``nn.Linear`` layers only;
+        unlike the deprecated ``torch.ao.quantization.quantize_dynamic``
+        this does not also cover ``nn.LSTM``/``nn.GRU``.
         """
+        if not HAS_TORCHAO:
+            raise ImportError("torchao is required. Install with: pip install torchao")
         import copy
         m = copy.deepcopy(model)
         m.eval()
-        quantized = tq.quantize_dynamic(
-            m,
-            {nn.Linear, nn.LSTM, nn.GRU},
-            dtype=torch.qint8,
-        )
-        return quantized
+        quantize_(m, Int8DynamicActivationInt8WeightConfig())
+        return m
 
     def _static_int8(
         self,
@@ -215,16 +236,27 @@ class RealQuantizer:
 # Utilities
 # ------------------------------------------------------------------
 
+def _tensor_storage_bytes(t: "torch.Tensor") -> int:
+    """
+    Return the real storage size of a tensor in bytes.
+
+    Tensor-subclass parameters (e.g. torchao's ``Int8Tensor``) report
+    their *logical* dtype/shape via ``element_size()``/``nelement()`` —
+    for a float32-logical int8-packed weight that silently reports the
+    unquantized float32 size. ``__tensor_flatten__`` unwraps such a
+    subclass to its real packed inner tensors (quantized data, scale,
+    zero point, ...), recursively, so compression is measured honestly.
+    """
+    if hasattr(t, "__tensor_flatten__"):
+        attrs, _ = t.__tensor_flatten__()
+        return sum(_tensor_storage_bytes(getattr(t, name)) for name in attrs)
+    return t.nelement() * t.element_size()
+
+
 def _model_size_mb(model: "nn.Module") -> float:
     """Return the in-memory parameter size of ``model`` in megabytes."""
-    total_bytes = sum(
-        p.nelement() * p.element_size()
-        for p in model.parameters()
-    )
-    total_bytes += sum(
-        b.nelement() * b.element_size()
-        for b in model.buffers()
-    )
+    total_bytes = sum(_tensor_storage_bytes(p.data) for p in model.parameters())
+    total_bytes += sum(_tensor_storage_bytes(b) for b in model.buffers())
     return total_bytes / (1024 ** 2)
 
 

@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 optimization = [
     "torch>=2.0",
+    "torchao>=0.18",
     "numpy>=1.24",
 ]
 onnx = [
