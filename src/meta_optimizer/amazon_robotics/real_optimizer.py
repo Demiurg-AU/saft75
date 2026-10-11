@@ -192,14 +192,14 @@ class OptimizationPipeline:
                 result.errors.append(f"ONNX export failed: {er.error}")
 
         # --- Aggregate final metrics ---
-        result.final_metrics = self._compute_final_metrics(result, model, current_model, test_input)
+        result.final_metrics = self._compute_final_metrics(strat, model, current_model, test_input)
         result.overall_success = len(result.errors) == 0
 
         return result.to_dict()
 
     def _compute_final_metrics(
         self,
-        result: PipelineResult,
+        strat: OptimizationStrategy,
         original_model: "nn.Module",
         final_model: "nn.Module",
         test_input: "torch.Tensor",
@@ -222,7 +222,8 @@ class OptimizationPipeline:
             "original_latency_ms": round(original_latency, 3),
             "final_latency_ms": round(final_latency, 3),
             "latency_improvement": round(latency_improvement, 2),
-            "meets_latency_target": final_latency <= result.final_metrics.get("target_latency_ms", float("inf")),
+            "meets_latency_target": final_latency <= strat.target_latency_ms,
+            "meets_size_target": final_size <= strat.target_size_mb,
         }
 
     def compare_strategies(
