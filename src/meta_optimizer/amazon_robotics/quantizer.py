@@ -189,6 +189,18 @@ class RealQuantizer:
         calibration data required. Targets ``nn.Linear`` layers only;
         unlike the deprecated ``torch.ao.quantization.quantize_dynamic``
         this does not also cover ``nn.LSTM``/``nn.GRU``.
+
+        Unlike ``_static_int8``, the returned module keeps the original
+        ``nn.Module`` structure — ``quantize_`` replaces each Linear's
+        ``.weight`` in place with a tensor-subclass (``Int8Tensor``)
+        rather than re-exporting the graph — so its ``state_dict()``
+        keys are unchanged (``"0.weight"``, not ``"_frozen_param0"``).
+        That means it follows torchao's documented eager-mode
+        serialization path instead of ``_static_int8``'s
+        ``torch.export.save``/``load`` one: build a fresh instance of
+        the *original* architecture on ``torch.device("meta")``, then
+        ``fresh.load_state_dict(torch.load(path), assign=True)``.
+        Verified end-to-end on this method's output.
         """
         if not HAS_TORCHAO:
             raise ImportError("torchao is required. Install with: pip install torchao")
@@ -220,6 +232,18 @@ class RealQuantizer:
         ``.train()``/``.eval()`` normally (``allow_exported_model_train_eval``
         below patches those two methods onto this specific instance only
         — it does not affect any other model in the process).
+
+        torchao's other documented serialization path — save/load a
+        tensor-subclass parameter's ``state_dict()`` into a fresh
+        instance on ``torch.device("meta")`` with ``assign=True`` (see
+        ``_dynamic_int8``'s docstring) — does not apply here: verified
+        that ``_frozen_param0`` is a plain ``torch.int8`` tensor, not a
+        tensor subclass, and even disregarding that, the key names
+        (``_frozen_param0``/``_scale_0``) don't match any
+        ``nn.Sequential``'s ``state_dict()`` shape regardless of
+        ``_drop_unused_attrs`` — that's inherent to going through
+        ``torch.export`` at all, not something this method's cleanup
+        step causes.
 
         It also can't be persisted with plain ``torch.save()`` — verified:
         pickling the converted ``GraphModule`` directly raises
