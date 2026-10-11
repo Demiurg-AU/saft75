@@ -12,6 +12,7 @@ from .real_optimizer import (
     PipelineResult,
     PREDEFINED_STRATEGIES,
 )
+from .serialization import SdRecipe, save_sd_recipe, load_sd_recipe
 
 __all__ = [
     "RealQuantizer",
@@ -27,4 +28,7 @@ __all__ = [
     "OptimizationStrategy",
     "PipelineResult",
     "PREDEFINED_STRATEGIES",
+    "SdRecipe",
+    "save_sd_recipe",
+    "load_sd_recipe",
 ]
