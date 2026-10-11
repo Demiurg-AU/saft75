@@ -220,6 +220,17 @@ class RealQuantizer:
         ``.train()``/``.eval()`` normally (``allow_exported_model_train_eval``
         below patches those two methods onto this specific instance only
         — it does not affect any other model in the process).
+
+        It also can't be persisted with plain ``torch.save()`` — verified:
+        pickling the converted ``GraphModule`` directly raises
+        ``AttributeError: Can't pickle local object
+        'wrap_dunder_call_ctx_manager.<locals>.inner'``, a property of any
+        ``torch.export``-produced ``GraphModule``, not something
+        ``_drop_unused_attrs``/``allow_exported_model_train_eval``
+        introduce. The verified working path is to re-export the
+        already-converted model and save *that*:
+        ``torch.export.save(torch.export.export(converted, (example_input,)), path)``,
+        reloaded via ``torch.export.load(path).module()``.
         """
         if not HAS_TORCHAO:
             raise ImportError("torchao is required. Install with: pip install torchao")
