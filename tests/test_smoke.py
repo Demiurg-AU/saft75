@@ -293,6 +293,113 @@ def test_s2_onnx_export_variants_c_and_e(tmp_path):
         assert result.max_abs_vs_torch is not None, variant_name
 
 
+def test_conv_coverage_strategies_via_pipeline_mobilenet_v2(tmp_path):
+    """
+    Step 7 #4: conv coverage — ``fast_int8_conv_s1`` (swap_conv2d_1x1_to_linear
+    + Int8WeightOnlyConfig, S1/sd+recipe-compatible — variant C from PR #2/#3's
+    exploratory tests) and ``fast_int8_conv_s2`` (PT2E static, S2/ONNX-only —
+    variant E), exercised through ``OptimizationPipeline.optimize()`` with a
+    named strategy, not a hand-rolled re-implementation of the transform, on
+    MobileNetV2 per the step-7 rule that size/compression-adjacent checks use
+    MobileNetV2, not a toy model. ``fast_int8`` (dynamic_int8) is unchanged
+    by this PR — these are two new, separate strategy names.
+
+    Acceptance per contract amendment A11-6 (compression is only measured
+    between artifacts of the *same format* as the FP32 baseline — never
+    FP32-in-memory vs a quantized file, or vice versa):
+
+    - s1 >= 3.4x: sd+recipe artifact bytes (the serialized state_dict file,
+      via ``save_sd_recipe`` — same ``torch.save`` format on both sides) for
+      FP32 vs the quantized model. The quantized model itself comes from
+      ``RealQuantizer`` configured with the strategy's own declared
+      ``quantization_type`` (the exact class/method ``optimize()`` calls
+      internally) — not a hand-written torchao call — and
+      ``quantizer._int8_weight_only_conv`` (the real method that produced
+      it) is passed as ``save_sd_recipe``'s ``transform_fn``, so the
+      recorded provenance hash matches the actual production code, not a
+      duplicate reimplementation of it.
+    - s2 >= 3.3x: ONNX artifact bytes (.onnx + .onnx.data combined — see
+      exporter.py's module docstring) for FP32 vs the quantized model, both
+      exported through the same ``ModelExporter.export_onnx`` call path —
+      the FP32 side via a second call on the original model, the quantized
+      side via ``optimize()``'s own ``onnx_output_dir`` export.
+
+    ``ExportResult`` no longer carries a ``size_reduction`` property (see
+    exporter.py's module docstring for why: it used to compare an ONNX file
+    to the in-memory size of whatever model was passed into ``export_onnx``,
+    which by the time the pipeline calls it is already the quantized model,
+    not FP32 — a cross-format, misleading ratio under A11-6).
+
+    max_abs vs torch is recorded as present, with no pass/fail bound —
+    MobileNetV2 with random (untrained) weights produces near-float32-
+    noise-floor output magnitude, making a precision threshold on this
+    comparison numerically meaningless (established earlier this session
+    against the XMG archive).
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchao")
+    torchvision = pytest.importorskip("torchvision")
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    from torchvision.models import mobilenet_v2
+    from meta_optimizer.amazon_robotics import (
+        OptimizationPipeline,
+        PREDEFINED_STRATEGIES,
+        RealQuantizer,
+        QuantizationConfig,
+        ModelExporter,
+        ExportConfig,
+        save_sd_recipe,
+    )
+
+    assert PREDEFINED_STRATEGIES["fast_int8"].quantization_type == "dynamic_int8"
+
+    torch.manual_seed(0)
+    model = mobilenet_v2(weights=None).eval()
+    test_input = torch.randn(1, 3, 160, 160)
+    pipeline = OptimizationPipeline()
+
+    # --- s1: acceptance gate via optimize() with the named strategy ---
+    result_s1 = pipeline.optimize(model=model, test_input=test_input, strategy="fast_int8_conv_s1")
+    assert result_s1["overall_success"], result_s1["errors"]
+    assert result_s1["quantization_result"]["success"], result_s1["quantization_result"]["error"]
+
+    # --- s1: A11-6 measurement — sd+recipe file bytes, FP32 vs quantized,
+    # same torch.save format on both sides. ---
+    strat_s1 = PREDEFINED_STRATEGIES["fast_int8_conv_s1"]
+    quantizer_s1 = RealQuantizer(QuantizationConfig(method=strat_s1.quantization_type))
+    quantized_s1 = quantizer_s1.quantize(model, test_input).quantized_model
+
+    fp32_sd = save_sd_recipe(model, lambda m: m, strategy_name="fp32_baseline")
+    quant_sd = save_sd_recipe(quantized_s1, quantizer_s1._int8_weight_only_conv, strategy_name="fast_int8_conv_s1")
+    ratio_s1 = len(fp32_sd.state_dict_bytes) / len(quant_sd.state_dict_bytes)
+    assert ratio_s1 >= 3.4, ratio_s1
+
+    # --- s2: acceptance gate via optimize() with the named strategy,
+    # exporting the quantized model to ONNX through its own onnx_output_dir. ---
+    result_s2 = pipeline.optimize(
+        model=model, test_input=test_input, strategy="fast_int8_conv_s2",
+        onnx_output_dir=str(tmp_path),
+    )
+    assert result_s2["overall_success"], result_s2["errors"]
+    assert result_s2["quantization_result"]["success"], result_s2["quantization_result"]["error"]
+    export_result = result_s2["export_result"]
+    assert export_result["success"], export_result["error"]
+    assert export_result["external_data"] is True
+    # Recorded as-is — no threshold asserted here (see docstring).
+    assert export_result["max_abs_vs_torch"] is not None
+
+    # --- s2: A11-6 measurement — ONNX artifact bytes, FP32 vs quantized,
+    # both exported through the same ModelExporter.export_onnx call path. ---
+    exporter = ModelExporter(ExportConfig())
+    fp32_export = exporter.export_onnx(model, test_input, str(tmp_path / "fp32_baseline.onnx"))
+    assert fp32_export.success, fp32_export.error
+    fp32_onnx_bytes = fp32_export.graph_bytes + (fp32_export.data_bytes or 0)
+    quant_onnx_bytes = export_result["graph_bytes"] + export_result["data_bytes"]
+    ratio_s2 = fp32_onnx_bytes / quant_onnx_bytes
+    assert ratio_s2 >= 3.3, ratio_s2
+
+
 def test_pipeline_readme_quick_start():
     torch = pytest.importorskip("torch")
     from meta_optimizer.amazon_robotics import OptimizationPipeline

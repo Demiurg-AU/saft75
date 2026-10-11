@@ -15,6 +15,16 @@ verified empirically: for a quantized MobileNetV2 variant, the ``.onnx``
 graph file alone was *smaller* than FP32's own graph file by a naive
 read, while the true total (graph + data) was the honestly compressed
 one. ``_onnx_artifact_size`` below always sums both files.
+
+``ExportResult`` deliberately has no ``size_reduction`` property: a
+caller typically passes an already-quantized model into ``export_onnx``
+(e.g. the pipeline exports post-quantization), so ``original_size_mb``
+is that quantized model's own in-memory size, not the true FP32
+baseline — a ratio built from it would compare an ONNX file against a
+different format (in-memory PyTorch tensors) instead of against FP32 in
+the *same* format, which is meaningless (a same-format FP32-vs-ONNX
+ratio needs a second ``export_onnx`` call on the FP32 model and is the
+caller's responsibility to compute, as the test suite does).
 """
 from __future__ import annotations
 
@@ -74,12 +84,6 @@ class ExportResult:
     max_abs_vs_torch: Optional[float] = None
 
     @property
-    def size_reduction(self) -> float:
-        if self.original_size_mb == 0:
-            return 0.0
-        return 1.0 - self.exported_size_mb / self.original_size_mb
-
-    @property
     def latency_improvement(self) -> float:
         if self.exported_latency_ms == 0:
             return 0.0
@@ -91,7 +95,6 @@ class ExportResult:
             "output_path": self.output_path,
             "original_size_mb": round(self.original_size_mb, 3),
             "exported_size_mb": round(self.exported_size_mb, 3),
-            "size_reduction": round(self.size_reduction, 3),
             "original_latency_ms": round(self.original_latency_ms, 3),
             "exported_latency_ms": round(self.exported_latency_ms, 3),
             "latency_improvement": round(self.latency_improvement, 2),
