@@ -1,33 +1,71 @@
 """
-Structured and unstructured neural network pruning.
+Structured neural network pruning via real channel/filter removal.
 
 Implements:
-- Unstructured L1/random weight pruning
-- Structured channel/filter pruning (L2-norm based)
-- Iterative magnitude pruning with fine-tuning hooks
+- Structured L2-norm channel pruning that rebuilds each prunable layer with
+  genuinely fewer output channels/features (and trims the next layer's
+  input dimension to match), rather than masking weights to zero in place
+  (``torch.nn.utils.prune`` only zeroes weights; it never changes tensor
+  shape, so size/latency never move regardless of amount).
+
+Pruning is applied per "island": a ``nn.Sequential`` chain (found anywhere
+in the model's module tree, possibly nested, e.g. inside a custom block
+like torchvision's ``InvertedResidual``) whose flattened content consists
+only of ``nn.Linear``/``nn.Conv2d``, ``nn.BatchNorm1d``/``nn.BatchNorm2d``
+(co-trimmed in lockstep with the conv/linear immediately before them), a
+depthwise ``nn.Conv2d`` (``groups == in_channels == out_channels`` — a
+pass-through layer whose own channel count is dictated by whatever
+upstream decided, never independently chosen), and plain activation/
+pooling/dropout/flatten layers. Each island is pruned independently and
+never at its own boundary (first layer's input, last layer's output are
+untouched) — islands are never merged across a non-Sequential boundary
+(e.g. a residual add hidden in a custom ``forward()``, as in MobileNetV2's
+``InvertedResidual``), so a block's own input/output channel count, and
+anything a residual connection depends on, is never touched; only a
+block's *internal* channels (e.g. the expanded hidden dimension inside an
+inverted residual) are ever pruned. A model with no supported island
+anywhere raises ``NotImplementedError`` rather than silently doing
+nothing.
+
+Unstructured pruning (``torch.nn.utils.prune``'s usual approach: zero out
+individual weights, keep the tensor's shape unchanged) is not implemented.
+Verified empirically (see ``tests/test_smoke.py``): on CPU, converting a
+masked dense tensor to ``torch.sparse_coo``/``sparse_csr`` only uses less
+memory than the dense tensor once sparsity exceeds roughly 80% (COO) or
+70% (CSR) — the per-nonzero index overhead dominates below that. None of
+this library's predefined strategies prune anywhere near that threshold,
+so there is no CPU-beneficial way to implement unstructured pruning for
+the amounts this library actually offers.
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     import torch
     import torch.nn as nn
-    import torch.nn.utils.prune as prune
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
 
+if HAS_TORCH:
+    _PRUNABLE_TYPES = (nn.Linear, nn.Conv2d)
+    _BN_TYPES = (nn.BatchNorm1d, nn.BatchNorm2d)
+    _TRANSPARENT_TYPES = (
+        nn.ReLU, nn.ReLU6, nn.LeakyReLU, nn.ELU, nn.GELU, nn.SiLU,
+        nn.Sigmoid, nn.Tanh, nn.Dropout, nn.Identity, nn.Flatten,
+        nn.MaxPool2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d,
+    )
+
+
 @dataclass
 class PruningConfig:
     """Configuration for a pruning pass."""
-    method: str = "unstructured_l1"    # unstructured_l1 | unstructured_random | structured_l2
-    amount: float = 0.3               # Fraction of connections/channels to prune (0–1)
-    target_layers: Optional[List[str]] = None   # Layer class names to prune (None = all Linear/Conv)
-    make_permanent: bool = True       # Remove pruning masks after applying
+    method: str = "structured_l2"      # structured_l2 only — see module docstring
+    amount: float = 0.3                # Fraction of output channels/features to prune (0-1)
 
 
 @dataclass
@@ -84,10 +122,11 @@ class PruningResult:
 
 class RealPruner:
     """
-    Production-grade neural network pruner.
+    Structured neural network pruner with real channel removal.
 
-    Supports unstructured magnitude-based pruning (L1/random) and
-    structured channel pruning based on L2 norms.
+    See the module docstring for exactly what's supported (``nn.Sequential``
+    "islands" of Linear/Conv2d/BatchNorm/depthwise-conv/activations, found
+    anywhere in the model tree) and why unstructured pruning isn't offered.
     """
 
     def __init__(self, config: Optional[PruningConfig] = None) -> None:
@@ -129,19 +168,12 @@ class RealPruner:
             m = copy.deepcopy(model)
             m.eval()
 
-            if method == "unstructured_l1":
-                self._unstructured_prune(m, amount, prune.L1Unstructured)
-            elif method == "unstructured_random":
-                self._unstructured_prune(m, amount, prune.RandomUnstructured)
-            elif method == "structured_l2":
-                self._structured_prune(m, amount)
+            if method == "structured_l2":
+                m = self._structured_prune(m, amount)
             else:
                 raise ValueError(f"Unknown pruning method: {method}")
 
-            if self.config.make_permanent:
-                self._make_permanent(m)
-
-            pruned_params = _count_nonzero_params(m)
+            pruned_params = _count_params(m)
             pruned_size = _model_size_mb(m)
             pruned_latency = _benchmark_latency(m, test_input)
 
@@ -174,63 +206,246 @@ class RealPruner:
             )
 
     # ------------------------------------------------------------------
-    # Internal implementations
+    # Internal implementation
     # ------------------------------------------------------------------
 
-    def _unstructured_prune(
-        self,
-        model: "nn.Module",
-        amount: float,
-        pruning_class: Any,
-    ) -> None:
-        """Apply unstructured pruning to all Linear and Conv2d layers."""
-        target_types = self._target_layer_types()
-        params_to_prune = [
-            (module, "weight")
-            for module in model.modules()
-            if isinstance(module, target_types)
-        ]
-        if not params_to_prune:
-            return
-        prune.global_unstructured(
-            params_to_prune,
-            pruning_method=pruning_class,
-            amount=amount,
-        )
-
-    def _structured_prune(self, model: "nn.Module", amount: float) -> None:
+    def _structured_prune(self, model: "nn.Module", amount: float) -> "nn.Module":
         """
-        Structured L2-norm pruning: remove the ``amount`` fraction of
-        output channels from each Conv2d / Linear layer.
+        Find every prunable "island" (see module docstring) in ``model``
+        and physically rebuild it with ``amount`` fewer output channels on
+        each non-final prunable layer. Raises ``NotImplementedError`` if
+        ``model`` contains no supported island at all.
         """
-        target_types = self._target_layer_types()
-        for module in model.modules():
-            if isinstance(module, nn.Conv2d):
-                n_to_remove = max(1, int(module.out_channels * amount))
-                n_to_keep = max(1, module.out_channels - n_to_remove)
-                if n_to_keep < module.out_channels:
-                    prune.ln_structured(module, name="weight", amount=amount, n=2, dim=0)
-            elif isinstance(module, nn.Linear):
-                prune.l1_unstructured(module, name="weight", amount=amount)
+        if isinstance(model, nn.Sequential) and _is_prunable_island(model):
+            return nn.Sequential(*_prune_flat_chain(_flatten_sequential(model), amount))
 
-    def _make_permanent(self, model: "nn.Module") -> None:
-        """Remove pruning re-parametrizations, making the mask permanent."""
-        for module in model.modules():
-            if hasattr(module, "weight_orig"):
-                try:
-                    prune.remove(module, "weight")
-                except Exception:
-                    pass
+        found = _prune_tree(model, amount)
+        if found == 0:
+            raise NotImplementedError(
+                f"structured pruning found no supported nn.Sequential chain of "
+                f"{[t.__name__ for t in _PRUNABLE_TYPES]}/BatchNorm/activation "
+                f"layers anywhere in {type(model).__name__} — nothing to prune"
+            )
+        return model
 
-    def _target_layer_types(self) -> Tuple:
-        types = []
-        if self.config.target_layers is None:
-            return (nn.Linear, nn.Conv2d)
-        for name in self.config.target_layers:
-            cls = getattr(nn, name, None)
-            if cls is not None:
-                types.append(cls)
-        return tuple(types) if types else (nn.Linear, nn.Conv2d)
+
+# ------------------------------------------------------------------
+# Island discovery and in-place tree rewriting
+# ------------------------------------------------------------------
+
+def _flatten_sequential(seq: "nn.Sequential") -> List["nn.Module"]:
+    """Recursively resolve nested nn.Sequential children into a flat list."""
+    flat: List["nn.Module"] = []
+    for child in seq:
+        if isinstance(child, nn.Sequential):
+            flat.extend(_flatten_sequential(child))
+        else:
+            flat.append(child)
+    return flat
+
+
+def _is_supported_leaf(m: "nn.Module") -> bool:
+    return isinstance(m, _PRUNABLE_TYPES + _BN_TYPES + _TRANSPARENT_TYPES)
+
+
+def _is_prunable_island(seq: "nn.Sequential") -> bool:
+    flat = _flatten_sequential(seq)
+    return len(flat) > 0 and all(_is_supported_leaf(m) for m in flat)
+
+
+def _prune_tree(module: "nn.Module", amount: float) -> int:
+    """
+    Recursively find qualifying ``nn.Sequential`` islands among ``module``'s
+    descendants and replace each in place with its pruned, flattened
+    rebuild. Does not recurse further into an island once found (it's
+    processed as one self-contained unit). Returns how many islands were
+    found and pruned.
+    """
+    found = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Sequential) and _is_prunable_island(child):
+            new_flat = _prune_flat_chain(_flatten_sequential(child), amount)
+            setattr(module, name, nn.Sequential(*new_flat))
+            found += 1
+        else:
+            found += _prune_tree(child, amount)
+    return found
+
+
+# ------------------------------------------------------------------
+# Per-chain pruning
+# ------------------------------------------------------------------
+
+def _prune_flat_chain(flat_layers: List["nn.Module"], amount: float) -> List["nn.Module"]:
+    """
+    Prune a single flat chain of layers in place (conceptually — returns a
+    new list). "Decider" positions (plain ``nn.Linear`` or ``nn.Conv2d``
+    with ``groups == 1``) each choose, via L2 norm, which ``amount``
+    fraction of their own output channels to drop — except the chain's
+    last decider, whose output is the chain's own output contract and is
+    never touched. A depthwise ``nn.Conv2d`` never makes its own decision;
+    it just carries forward whatever channel subset the previous decider
+    chose. A BatchNorm immediately downstream of a trimmed layer is
+    re-sliced to match, using that same layer's own (pre-rebuild) output
+    index space.
+    """
+    decider_positions = [
+        i for i, layer in enumerate(flat_layers)
+        if isinstance(layer, nn.Linear) or (isinstance(layer, nn.Conv2d) and layer.groups == 1)
+    ]
+    if not decider_positions:
+        return flat_layers
+    last_decider = decider_positions[-1]
+
+    new_layers = list(flat_layers)
+    carry_keep: Optional["torch.Tensor"] = None
+    carry_block_size = 1
+
+    for i, layer in enumerate(flat_layers):
+        if isinstance(layer, nn.Linear):
+            is_last = i == last_decider
+            in_keep = _expand_keep(carry_keep, carry_block_size)
+            new_layer, out_keep = _rebuild_linear(layer, amount, in_keep, is_last)
+            new_layers[i] = new_layer
+            carry_keep, carry_block_size = out_keep, 1
+
+        elif isinstance(layer, nn.Conv2d) and layer.groups == 1:
+            is_last = i == last_decider
+            new_layer, out_keep = _rebuild_conv2d(layer, amount, carry_keep, is_last)
+            new_layers[i] = new_layer
+            carry_keep = out_keep
+            next_decider = next((d for d in decider_positions if d > i), None)
+            if next_decider is not None and isinstance(flat_layers[next_decider], nn.Linear):
+                next_in_features = flat_layers[next_decider].in_features
+                if next_in_features % layer.out_channels != 0:
+                    raise NotImplementedError(
+                        "cannot map Conv2d output channels onto the next "
+                        f"Linear's in_features={next_in_features} (not a "
+                        f"multiple of out_channels={layer.out_channels}); "
+                        "unsupported reshape between Conv2d and Linear"
+                    )
+                carry_block_size = next_in_features // layer.out_channels
+            else:
+                carry_block_size = 1
+
+        elif isinstance(layer, nn.Conv2d) and layer.groups == layer.in_channels == layer.out_channels:
+            if carry_keep is not None:
+                new_layers[i] = _rebuild_depthwise(layer, carry_keep)
+            # else: nothing upstream decided a subset — leave untouched,
+            # carry_keep stays None.
+
+        elif isinstance(layer, nn.Conv2d):
+            raise NotImplementedError(
+                f"structured pruning does not support grouped Conv2d with "
+                f"groups={layer.groups} that is neither groups=1 nor fully "
+                "depthwise (groups == in_channels == out_channels)"
+            )
+
+        elif isinstance(layer, _BN_TYPES):
+            if carry_keep is not None:
+                new_layers[i] = _rebuild_batchnorm(layer, carry_keep)
+            # carry_keep is unchanged either way — BN never changes channel count.
+
+        elif isinstance(layer, _TRANSPARENT_TYPES):
+            pass
+
+        else:
+            raise NotImplementedError(
+                f"unsupported layer type in prunable chain: {type(layer).__name__}"
+            )
+
+    return new_layers
+
+
+def _expand_keep(carry_keep: Optional["torch.Tensor"], block_size: int) -> Optional["torch.Tensor"]:
+    if carry_keep is None:
+        return None
+    if block_size == 1:
+        return carry_keep
+    return torch.cat([
+        torch.arange(c * block_size, (c + 1) * block_size)
+        for c in carry_keep.tolist()
+    ])
+
+
+def _rebuild_linear(layer: "nn.Linear", amount: float, in_keep, is_last: bool):
+    W = layer.weight.data
+    b = layer.bias.data if layer.bias is not None else None
+    if in_keep is not None:
+        W = W[:, in_keep]
+    out_keep = _select_keep(W.reshape(W.shape[0], -1), amount, is_last)
+    new_layer = nn.Linear(W.shape[1], len(out_keep), bias=b is not None)
+    new_layer.weight.data = W[out_keep].clone()
+    if b is not None:
+        new_layer.bias.data = b[out_keep].clone()
+    return new_layer, out_keep
+
+
+def _rebuild_conv2d(layer: "nn.Conv2d", amount: float, in_keep, is_last: bool):
+    W = layer.weight.data
+    b = layer.bias.data if layer.bias is not None else None
+    if in_keep is not None:
+        W = W[:, in_keep]
+    out_keep = _select_keep(W.reshape(W.shape[0], -1), amount, is_last)
+    new_layer = nn.Conv2d(
+        W.shape[1], len(out_keep),
+        kernel_size=layer.kernel_size, stride=layer.stride,
+        padding=layer.padding, dilation=layer.dilation,
+        groups=1, bias=b is not None,
+    )
+    new_layer.weight.data = W[out_keep].clone()
+    if b is not None:
+        new_layer.bias.data = b[out_keep].clone()
+    return new_layer, out_keep
+
+
+def _rebuild_depthwise(layer: "nn.Conv2d", in_keep: "torch.Tensor") -> "nn.Conv2d":
+    """
+    A depthwise conv (``groups == in_channels == out_channels``) maps
+    channel i to channel i — it never chooses its own channel subset, it
+    just keeps whichever channels ``in_keep`` (the upstream decider's own
+    output index space) selected.
+    """
+    W = layer.weight.data[in_keep]
+    b = layer.bias.data[in_keep] if layer.bias is not None else None
+    new_layer = nn.Conv2d(
+        len(in_keep), len(in_keep),
+        kernel_size=layer.kernel_size, stride=layer.stride,
+        padding=layer.padding, dilation=layer.dilation,
+        groups=len(in_keep), bias=b is not None,
+    )
+    new_layer.weight.data = W.clone()
+    if b is not None:
+        new_layer.bias.data = b.clone()
+    return new_layer
+
+
+def _rebuild_batchnorm(bn: "nn.Module", keep: "torch.Tensor") -> "nn.Module":
+    """Re-slice a BatchNorm's per-channel parameters/buffers by ``keep``."""
+    cls = type(bn)
+    new_bn = cls(
+        len(keep), eps=bn.eps, momentum=bn.momentum,
+        affine=bn.affine, track_running_stats=bn.track_running_stats,
+    )
+    if bn.affine:
+        new_bn.weight.data = bn.weight.data[keep].clone()
+        new_bn.bias.data = bn.bias.data[keep].clone()
+    if bn.track_running_stats and bn.running_mean is not None:
+        new_bn.running_mean.data = bn.running_mean.data[keep].clone()
+        new_bn.running_var.data = bn.running_var.data[keep].clone()
+        new_bn.num_batches_tracked.data = bn.num_batches_tracked.data.clone()
+    return new_bn
+
+
+def _select_keep(weight_2d: "torch.Tensor", amount: float, is_last: bool) -> "torch.Tensor":
+    """Return sorted indices of output rows to keep, by L2 norm."""
+    n_out = weight_2d.shape[0]
+    if is_last:
+        return torch.arange(n_out)
+    norms = weight_2d.norm(p=2, dim=1)
+    n_remove = int(n_out * amount)
+    n_keep = max(1, n_out - n_remove)
+    return norms.argsort(descending=True)[:n_keep].sort().values
 
 
 # ------------------------------------------------------------------
@@ -239,10 +454,6 @@ class RealPruner:
 
 def _count_params(model: "nn.Module") -> int:
     return sum(p.numel() for p in model.parameters())
-
-
-def _count_nonzero_params(model: "nn.Module") -> int:
-    return sum(p.nonzero().size(0) for p in model.parameters())
 
 
 def _model_size_mb(model: "nn.Module") -> float:
