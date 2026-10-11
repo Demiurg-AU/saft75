@@ -5,9 +5,20 @@ Provides:
 - ONNX export with opset selection and shape validation
 - ONNX Runtime benchmarking
 - TensorRT engine building (optional, requires tensorrt package)
+
+Size measurement note: ``torch.onnx.export``'s dynamo-based exporter
+(torch>=2.x) writes large initializers to a separate ``<path>.data``
+file once they exceed a size threshold, rather than inlining them in
+the ``.onnx`` protobuf. Measuring only ``os.path.getsize(output_path)``
+silently undercounts the real artifact size whenever that happens —
+verified empirically: for a quantized MobileNetV2 variant, the ``.onnx``
+graph file alone was *smaller* than FP32's own graph file by a naive
+read, while the true total (graph + data) was the honestly compressed
+one. ``_onnx_artifact_size`` below always sums both files.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -55,6 +66,12 @@ class ExportResult:
     exported_latency_ms: float
     success: bool = True
     error: Optional[str] = None
+    graph_bytes: Optional[int] = None
+    data_bytes: Optional[int] = None
+    external_data: bool = False
+    graph_sha256: Optional[str] = None
+    data_sha256: Optional[str] = None
+    max_abs_vs_torch: Optional[float] = None
 
     @property
     def size_reduction(self) -> float:
@@ -80,6 +97,12 @@ class ExportResult:
             "latency_improvement": round(self.latency_improvement, 2),
             "success": self.success,
             "error": self.error,
+            "graph_bytes": self.graph_bytes,
+            "data_bytes": self.data_bytes,
+            "external_data": self.external_data,
+            "graph_sha256": self.graph_sha256,
+            "data_sha256": self.data_sha256,
+            "max_abs_vs_torch": self.max_abs_vs_torch,
         }
 
 
@@ -157,11 +180,20 @@ class ModelExporter:
             onnx_model = onnx.load(output_path)
             onnx.checker.check_model(onnx_model)
 
-            exported_size = os.path.getsize(output_path) / (1024 ** 2)
-            exported_latency = (
-                _ort_benchmark(output_path, test_input)
-                if HAS_ORT else original_latency
+            total_bytes, graph_bytes, data_bytes, external_data, graph_sha256, data_sha256 = (
+                _onnx_artifact_size(output_path)
             )
+            exported_size = total_bytes / (1024 ** 2)
+
+            max_abs_vs_torch = None
+            if HAS_ORT:
+                exported_latency = _ort_benchmark(output_path, test_input)
+                with torch.no_grad():
+                    torch_out = model(test_input)
+                ort_out = _ort_output(output_path, test_input)
+                max_abs_vs_torch = float((torch.as_tensor(ort_out) - torch_out).abs().max())
+            else:
+                exported_latency = original_latency
 
             return ExportResult(
                 format="onnx",
@@ -170,6 +202,12 @@ class ModelExporter:
                 exported_size_mb=exported_size,
                 original_latency_ms=original_latency,
                 exported_latency_ms=exported_latency,
+                graph_bytes=graph_bytes,
+                data_bytes=data_bytes,
+                external_data=external_data,
+                graph_sha256=graph_sha256,
+                data_sha256=data_sha256,
+                max_abs_vs_torch=max_abs_vs_torch,
             )
 
         except Exception as exc:
@@ -304,3 +342,35 @@ def _ort_benchmark(
     for _ in range(runs):
         sess.run(None, {input_name: np_input})
     return ((time.perf_counter() - start) / runs) * 1000.0
+
+
+def _ort_output(onnx_path: str, test_input: "torch.Tensor"):
+    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    return sess.run(None, {input_name: test_input.numpy()})[0]
+
+
+def _sha256_file(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _onnx_artifact_size(output_path: str) -> Tuple[int, int, int, bool, str, Optional[str]]:
+    """
+    Returns (total_bytes, graph_bytes, data_bytes, external_data,
+    graph_sha256, data_sha256) — ``total_bytes`` is the real artifact
+    size (graph + external data, if any); see module docstring for why
+    the graph file alone undercounts.
+    """
+    graph_bytes = os.path.getsize(output_path)
+    graph_sha256 = _sha256_file(output_path)
+    data_path = output_path + ".data"
+    if os.path.exists(data_path):
+        data_bytes = os.path.getsize(data_path)
+        data_sha256 = _sha256_file(data_path)
+        external_data = True
+    else:
+        data_bytes = 0
+        data_sha256 = None
+        external_data = False
+    return graph_bytes + data_bytes, graph_bytes, data_bytes, external_data, graph_sha256, data_sha256

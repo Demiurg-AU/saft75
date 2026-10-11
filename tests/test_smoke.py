@@ -220,6 +220,79 @@ def test_sd_recipe_rejects_corrupted_state_dict():
         load_sd_recipe(corrupted_bytes, sd_recipe.recipe, build_meta, transform, strict=False)
 
 
+def test_s2_onnx_export_variants_c_and_e(tmp_path):
+    """
+    Step 7 #3: S2 (ONNX) export for variants C (swap_conv2d_1x1_to_linear +
+    Int8WeightOnlyConfig) and E (PT2E static, X86InductorQuantizer).
+
+    Size is measured as .onnx + .onnx.data combined — see exporter.py's
+    module docstring for why the graph file alone undercounts. max_abs
+    vs torch is recorded as-is, with no pass/fail threshold: E is known
+    (from the XMG witness run) to diverge by ~0.32 in this comparison,
+    which is a real, open question for E1 to resolve, not something to
+    paper over here.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchao")
+    torchvision = pytest.importorskip("torchvision")
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    from torchvision.models import mobilenet_v2
+    from torchao.quantization import quantize_, Int8WeightOnlyConfig
+    from torchao.quantization.quant_api import swap_conv2d_1x1_to_linear
+    from meta_optimizer.amazon_robotics import ModelExporter, ExportConfig
+    import copy
+
+    torch.manual_seed(0)
+    base = mobilenet_v2(weights=None).eval()
+    x = torch.randn(1, 3, 160, 160)
+
+    def build_c():
+        m = copy.deepcopy(base)
+        swap_conv2d_1x1_to_linear(m)
+        quantize_(m, Int8WeightOnlyConfig())
+        return m.eval()
+
+    def build_e():
+        from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
+        from torchao.quantization.pt2e.quantizer.x86_inductor_quantizer import (
+            X86InductorQuantizer, get_default_x86_inductor_quantization_config,
+        )
+        from torchao.quantization.pt2e import allow_exported_model_train_eval
+
+        m = copy.deepcopy(base)
+        gm = torch.export.export(m, (x,)).module()
+        q = X86InductorQuantizer()
+        q.set_global(get_default_x86_inductor_quantization_config())
+        prepared = prepare_pt2e(gm, q)
+        for _ in range(8):
+            prepared(torch.randn(1, 3, 160, 160))
+        converted = convert_pt2e(prepared)
+        allow_exported_model_train_eval(converted)
+        # Known pitfall (found earlier this session): .eval()'s return
+        # value is None for a PT2E-patched model — never chain it.
+        converted.eval()
+        return converted
+
+    exporter = ModelExporter(ExportConfig())
+    for variant_name, build_fn in (("C", build_c), ("E", build_e)):
+        model = build_fn()
+        output_path = str(tmp_path / f"s2_{variant_name}.onnx")
+        result = exporter.export_onnx(model, x, output_path)
+        assert result.success, result.error
+
+        assert result.graph_bytes is not None and result.graph_bytes > 0
+        assert result.external_data is True, variant_name
+        assert result.data_bytes is not None and result.data_bytes > 0
+        assert result.graph_sha256 is not None
+        assert result.data_sha256 is not None
+        assert result.exported_size_mb == pytest.approx(
+            (result.graph_bytes + result.data_bytes) / (1024 ** 2)
+        )
+        # Recorded as-is — no threshold asserted here (see docstring).
+        assert result.max_abs_vs_torch is not None, variant_name
+
+
 def test_pipeline_readme_quick_start():
     torch = pytest.importorskip("torch")
     from meta_optimizer.amazon_robotics import OptimizationPipeline

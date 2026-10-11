@@ -23,6 +23,12 @@ onnx = [
     "onnx>=1.14",
     "onnxruntime>=1.16",
 ]
+export = [
+    "meta-optimizer[optimization]",
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+    "onnxscript>=0.1",
+]
 chromadb = [
     "chromadb>=0.4",
     "sentence-transformers>=2.2",
