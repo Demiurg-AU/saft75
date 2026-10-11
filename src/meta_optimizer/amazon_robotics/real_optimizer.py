@@ -5,6 +5,7 @@ Provides predefined strategies and a unified interface for model optimization.
 """
 from __future__ import annotations
 
+import copy
 import os
 import tempfile
 import time
@@ -198,9 +199,12 @@ class OptimizationPipeline:
 
         # --- Step 1.5: Fine-tuning (mandatory for strategies that declare
         # it — hybrid_moderate/aggressive — run on the pruned float model,
-        # before quantization) ---
+        # before quantization). Distills from a frozen copy of the
+        # original pre-pruning FP32 model — never the pruned student
+        # itself, and never updated. ---
         if strat.fine_tune:
-            ft = fine_tune(current_model, fine_tune_config or FineTuneConfig())
+            teacher_model = copy.deepcopy(model).eval()
+            ft = fine_tune(current_model, teacher_model, fine_tune_config or FineTuneConfig())
             result.fine_tune_result = ft.to_dict()
             if ft.status != "VERIFIED":
                 result.errors.append(f"Fine-tuning {ft.status}: {ft.error}")
