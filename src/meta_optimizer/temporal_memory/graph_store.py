@@ -148,7 +148,19 @@ class NetworkXGraphStore:
         entity_type: Optional[str] = None,
         label_contains: Optional[str] = None,
         since: Optional[datetime] = None,
+        include_updates: bool = False,
     ) -> List[GraphNode]:
+        """
+        Args:
+            since: Only return nodes at or after this timestamp.
+            include_updates: When True, a node also matches if it was
+                *updated* at or after ``since``, even if created earlier.
+                Callers that promise "created or updated" semantics
+                (``what_changed_since``, ``find_related_in_timeframe``)
+                must pass this; callers that promise "created" semantics
+                (``get_timeline``) must not, since flipping the filter
+                for everyone would silently break that promise instead.
+        """
         results = list(self._nodes.values())
         if entity_type:
             results = [n for n in results if n.entity_type == entity_type]
@@ -156,7 +168,10 @@ class NetworkXGraphStore:
             lower = label_contains.lower()
             results = [n for n in results if lower in n.label.lower()]
         if since:
-            results = [n for n in results if n.created_at >= since]
+            if include_updates:
+                results = [n for n in results if n.created_at >= since or n.updated_at >= since]
+            else:
+                results = [n for n in results if n.created_at >= since]
         return results
 
     def update_node(self, node_id: str, properties: Dict[str, Any]) -> bool:
