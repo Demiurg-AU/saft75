@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 optimization = [
-    "torch>=2.0",
+    "torch>=2.1",
     "torchao>=0.18",
     "numpy>=1.24",
 ]

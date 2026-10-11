@@ -41,6 +41,25 @@ def test_quantizer_readme_testing_example():
     assert isinstance(quantizer.quantize(model, test_input).to_dict(), dict)
 
 
+def test_quantizer_static_int8():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchao")
+    from meta_optimizer.amazon_robotics import QuantizationConfig, RealQuantizer
+
+    quantizer = RealQuantizer(QuantizationConfig(method="static_int8", calibration_batches=2))
+    model = torch.nn.Sequential(
+        torch.nn.Linear(100, 50),
+        torch.nn.ReLU(),
+        torch.nn.Linear(50, 10),
+    )
+    test_input = torch.randn(1, 100)
+    result = quantizer.quantize(model, test_input)
+    assert result.success, result.error
+    assert result.size_reduction > 0
+    # The converted graph module must still run on fresh input afterwards.
+    assert result.quantized_model(torch.randn(1, 100)).shape == (1, 10)
+
+
 def test_pipeline_readme_quick_start():
     torch = pytest.importorskip("torch")
     from meta_optimizer.amazon_robotics import OptimizationPipeline

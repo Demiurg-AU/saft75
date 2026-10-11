@@ -5,12 +5,18 @@ Implements:
 - Dynamic INT8 quantization (no calibration data needed) — via torchao's
   ``quantize_()`` API, since ``torch.ao.quantization.quantize_dynamic`` is
   deprecated upstream and slated for removal.
-- Static INT8 quantization (with calibration) — via the legacy
-  ``torch.ao.quantization`` eager-mode API. Still functional but
-  deprecated upstream; not yet migrated to torchao's PT2E flow
-  (``prepare_pt2e``/``convert_pt2e``), which needs an observer-based
-  ``Quantizer`` and a ``torch.export``-captured graph rather than a
-  drop-in config swap.
+- Static INT8 quantization (with calibration) — via torchao's PT2E flow:
+  ``torch.export`` captures the graph, ``X86InductorQuantizer`` annotates
+  it, ``prepare_pt2e``/``convert_pt2e`` do the calibrated conversion.
+  Only ``backend="fbgemm"`` (x86) is supported: torchao's ARM/XNNPACK
+  quantizer only ships under its private ``torchao.testing`` namespace
+  in this version, not as a stable API, so ``backend="qnnpack"`` raises
+  rather than silently depending on a testing-only module. Converting
+  leaves the original float32 weight next to its quantized replacement
+  (``torch.export`` preserves the whole original submodule attribute,
+  even though the quantized graph never reads it) — ``_drop_unused_attrs``
+  removes that dead weight so size metrics reflect the real quantized
+  model rather than double-counting it.
 - INT4 weight-only quantization (via manual rounding) — kept as a
   CPU-only simulation. torchao's real INT4 tensor formats
   (``Int4WeightOnlyConfig``) all require either a CUDA GPU or the
@@ -37,6 +43,12 @@ except ImportError:
 
 try:
     from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfig
+    from torchao.quantization.pt2e import allow_exported_model_train_eval
+    from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
+    from torchao.quantization.pt2e.quantizer.x86_inductor_quantizer import (
+        X86InductorQuantizer,
+        get_default_x86_inductor_quantization_config,
+    )
     HAS_TORCHAO = True
 except ImportError:
     HAS_TORCHAO = False
@@ -192,24 +204,42 @@ class RealQuantizer:
         calibration_input: "torch.Tensor",
     ) -> "nn.Module":
         """
-        Static INT8 quantization — both weights and activations are
-        quantized using scale factors calibrated from representative data.
+        Static INT8 quantization via torchao's PT2E flow — both weights
+        and activations are quantized using scale factors calibrated
+        from representative data.
         """
+        if not HAS_TORCHAO:
+            raise ImportError("torchao is required. Install with: pip install torchao")
+        if self.config.backend != "fbgemm":
+            raise NotImplementedError(
+                f"backend={self.config.backend!r} has no stable torchao PT2E "
+                "quantizer in this version; only 'fbgemm' (X86InductorQuantizer) "
+                "is supported"
+            )
+
         import copy
         m = copy.deepcopy(model)
         m.eval()
 
-        backend = self.config.backend
-        m.qconfig = tq.get_default_qconfig(backend)
-        tq.prepare(m, inplace=True)
+        exported = torch.export.export(m, (calibration_input,))
+        graph_module = exported.module()
+
+        quantizer = X86InductorQuantizer()
+        quantizer.set_global(get_default_x86_inductor_quantization_config())
+        prepared = prepare_pt2e(graph_module, quantizer)
 
         # Calibration pass
         with torch.no_grad():
             for _ in range(self.config.calibration_batches):
-                m(calibration_input)
+                prepared(calibration_input)
 
-        tq.convert(m, inplace=True)
-        return m
+        converted = convert_pt2e(prepared)
+        _drop_unused_attrs(converted)
+        # Exported GraphModules reject .train()/.eval() by default, but
+        # _benchmark_latency (and any caller chaining this result into
+        # another step) calls .eval() on whatever model it's handed.
+        allow_exported_model_train_eval(converted)
+        return converted
 
     def _int4_weight_only(self, model: "nn.Module") -> "nn.Module":
         """
@@ -235,6 +265,29 @@ class RealQuantizer:
 # ------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------
+
+def _drop_unused_attrs(graph_module: "torch.fx.GraphModule") -> None:
+    """
+    Remove parameters/buffers that carry no ``get_attr`` node in
+    ``graph_module``'s traced graph.
+
+    ``torch.export`` preserves the full original submodule hierarchy as
+    plain attributes, independent of what the traced graph actually
+    reads. PT2E's converted graph never reads the original float32
+    weight (it reads a separately-stored quantized replacement instead),
+    so that weight sits there as dead memory unless removed — otherwise
+    a "quantized" model would measure *larger* than the original.
+    """
+    referenced = {n.target for n in graph_module.graph.nodes if n.op == "get_attr"}
+    dead = [name for name, _ in graph_module.named_parameters() if name not in referenced]
+    dead += [name for name, _ in graph_module.named_buffers() if name not in referenced]
+    for dotted_name in dead:
+        *path, leaf = dotted_name.split(".")
+        owner = graph_module
+        for part in path:
+            owner = getattr(owner, part)
+        delattr(owner, leaf)
+
 
 def _tensor_storage_bytes(t: "torch.Tensor") -> int:
     """

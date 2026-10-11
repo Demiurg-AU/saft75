@@ -10,13 +10,14 @@ as an installable package under `src/meta_optimizer/`:
 1. **Temporal Knowledge Graph (TKG) memory** — graph + vector hybrid storage for
    cross-session knowledge, with temporal queries ("what changed since last week?").
 2. **Real model optimization pipeline** — actual PyTorch quantization (dynamic INT8 via
-   `torchao.quantization.quantize_()`; static/calibrated INT8 via the legacy
-   `torch.ao.quantization` eager-mode API, deprecated upstream but not yet migrated to
-   torchao's PT2E flow; INT4 is simulated by rounding weights to 16 levels and storing
-   them back as float, not true INT4 storage/kernels — see `quantizer.py::_int4_weight_only`
-   for why: torchao's real INT4 tensor formats all require a CUDA GPU or the GPU-only
-   `mslk` package, so there's no portable INT4 kernel path for this CPU-first library),
-   pruning (structured/unstructured), and ONNX/TensorRT export, not placeholders.
+   `torchao.quantization.quantize_()`; static/calibrated INT8 via torchao's PT2E flow —
+   `torch.export` + `X86InductorQuantizer` + `prepare_pt2e`/`convert_pt2e`, x86 only, since
+   torchao's ARM/XNNPACK quantizer only ships under its private testing namespace; INT4 is
+   simulated by rounding weights to 16 levels and storing them back as float, not true INT4
+   storage/kernels — see `quantizer.py::_int4_weight_only` for why: torchao's real INT4
+   tensor formats all require a CUDA GPU or the GPU-only `mslk` package, so there's no
+   portable INT4 kernel path for this CPU-first library), pruning (structured/unstructured),
+   and ONNX/TensorRT export, not placeholders.
 3. **Workflow orchestration** — a small LangGraph-inspired explicit state machine with
    conditional routing, retry/error recovery, and parallel strategy execution.
 
