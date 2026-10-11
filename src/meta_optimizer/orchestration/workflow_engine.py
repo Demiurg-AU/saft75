@@ -41,11 +41,13 @@ class WorkflowNode:
         node_type: NodeType,
         handler: Optional[Callable] = None,
         description: str = "",
+        fallback: Optional[Callable] = None,
     ) -> None:
         self.name = name
         self.node_type = node_type
         self.handler = handler
         self.description = description
+        self.fallback = fallback
         self.transitions: Dict[str, str] = {}  # condition_key → next_node_name
 
     def add_transition(self, condition: str, target: str) -> None:
@@ -91,8 +93,17 @@ class WorkflowEngine:
         node_type: NodeType = NodeType.PROCESS,
         handler: Optional[Callable] = None,
         description: str = "",
+        fallback: Optional[Callable] = None,
     ) -> "WorkflowEngine":
-        self._nodes[name] = WorkflowNode(name, node_type, handler, description)
+        """
+        Args:
+            fallback: Optional callable invoked with the same context if
+                this node's handler fails on every retry attempt. See
+                ``ErrorHandler.run_with_retry`` — this is the "graceful
+                degradation" path; without it, exhausting all retries
+                just raises, same as before.
+        """
+        self._nodes[name] = WorkflowNode(name, node_type, handler, description, fallback)
         if node_type == NodeType.START:
             self._start_node = name
         return self
@@ -170,6 +181,7 @@ class WorkflowEngine:
                     current,
                     node.execute,
                     context,
+                    fallback=node.fallback,
                 )
                 if isinstance(result, dict):
                     context.update(result)
