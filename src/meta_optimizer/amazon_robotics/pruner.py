@@ -1,33 +1,53 @@
 """
-Structured and unstructured neural network pruning.
+Structured neural network pruning via real channel/filter removal.
 
 Implements:
-- Unstructured L1/random weight pruning
-- Structured channel/filter pruning (L2-norm based)
-- Iterative magnitude pruning with fine-tuning hooks
+- Structured L2-norm channel pruning for ``nn.Sequential`` chains of
+  ``nn.Linear``/``nn.Conv2d`` — rebuilds each layer with genuinely fewer
+  output channels/features (and trims the next layer's input dimension
+  to match), rather than masking weights to zero in place.
+
+Unstructured pruning (``torch.nn.utils.prune``'s usual approach: zero out
+individual weights, keep the tensor's shape unchanged) is intentionally
+not implemented. Verified empirically (see ``tests/test_smoke.py``): on
+CPU, converting a masked dense tensor to ``torch.sparse_coo``/
+``sparse_csr`` only uses less memory than the dense tensor once sparsity
+exceeds roughly 80% (COO) or 70% (CSR) — the per-nonzero index overhead
+dominates below that. None of this library's predefined strategies prune
+anywhere near that threshold (0.2/0.3/0.5), so there is no CPU-beneficial
+way to implement "real" unstructured pruning for the amounts this library
+actually offers; ``_unstructured_prune`` raises ``NotImplementedError``
+rather than silently reporting a compression number that storage doesn't
+back up.
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     import torch
     import torch.nn as nn
-    import torch.nn.utils.prune as prune
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
 
+if HAS_TORCH:
+    _PRUNABLE_TYPES = (nn.Linear, nn.Conv2d)
+    _TRANSPARENT_TYPES = (
+        nn.ReLU, nn.ReLU6, nn.LeakyReLU, nn.ELU, nn.GELU, nn.SiLU,
+        nn.Sigmoid, nn.Tanh, nn.Dropout, nn.Identity, nn.Flatten,
+        nn.MaxPool2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d,
+    )
+
+
 @dataclass
 class PruningConfig:
     """Configuration for a pruning pass."""
-    method: str = "unstructured_l1"    # unstructured_l1 | unstructured_random | structured_l2
-    amount: float = 0.3               # Fraction of connections/channels to prune (0–1)
-    target_layers: Optional[List[str]] = None   # Layer class names to prune (None = all Linear/Conv)
-    make_permanent: bool = True       # Remove pruning masks after applying
+    method: str = "structured_l2"      # structured_l2 | unstructured_l1 | unstructured_random
+    amount: float = 0.3                # Fraction of output channels/connections to prune (0-1)
 
 
 @dataclass
@@ -84,10 +104,12 @@ class PruningResult:
 
 class RealPruner:
     """
-    Production-grade neural network pruner.
+    Structured neural network pruner with real channel removal.
 
-    Supports unstructured magnitude-based pruning (L1/random) and
-    structured channel pruning based on L2 norms.
+    Only ``nn.Sequential`` chains of ``nn.Linear``/``nn.Conv2d`` (with
+    activations, ``Flatten``, pooling, or ``Dropout`` in between) are
+    supported — see the module docstring for why, and why unstructured
+    pruning is not offered at all.
     """
 
     def __init__(self, config: Optional[PruningConfig] = None) -> None:
@@ -129,19 +151,14 @@ class RealPruner:
             m = copy.deepcopy(model)
             m.eval()
 
-            if method == "unstructured_l1":
-                self._unstructured_prune(m, amount, prune.L1Unstructured)
-            elif method == "unstructured_random":
-                self._unstructured_prune(m, amount, prune.RandomUnstructured)
-            elif method == "structured_l2":
-                self._structured_prune(m, amount)
+            if method == "structured_l2":
+                m = self._structured_prune(m, amount)
+            elif method in ("unstructured_l1", "unstructured_random"):
+                self._unstructured_prune(amount)
             else:
                 raise ValueError(f"Unknown pruning method: {method}")
 
-            if self.config.make_permanent:
-                self._make_permanent(m)
-
-            pruned_params = _count_nonzero_params(m)
+            pruned_params = _count_params(m)
             pruned_size = _model_size_mb(m)
             pruned_latency = _benchmark_latency(m, test_input)
 
@@ -177,60 +194,136 @@ class RealPruner:
     # Internal implementations
     # ------------------------------------------------------------------
 
-    def _unstructured_prune(
-        self,
-        model: "nn.Module",
-        amount: float,
-        pruning_class: Any,
-    ) -> None:
-        """Apply unstructured pruning to all Linear and Conv2d layers."""
-        target_types = self._target_layer_types()
-        params_to_prune = [
-            (module, "weight")
-            for module in model.modules()
-            if isinstance(module, target_types)
-        ]
-        if not params_to_prune:
-            return
-        prune.global_unstructured(
-            params_to_prune,
-            pruning_method=pruning_class,
-            amount=amount,
+    def _unstructured_prune(self, amount: float) -> None:
+        """Always raises — see module docstring for the CPU-sparsity tradeoff."""
+        raise NotImplementedError(
+            f"unstructured pruning (amount={amount}) has no CPU-beneficial "
+            "implementation: converting a masked dense tensor to a sparse "
+            "format only uses less memory than the dense tensor above "
+            "~70-80% sparsity, and no predefined strategy in this library "
+            "prunes that aggressively. Use method='structured_l2' instead."
         )
 
-    def _structured_prune(self, model: "nn.Module", amount: float) -> None:
+    def _structured_prune(self, model: "nn.Module", amount: float) -> "nn.Module":
         """
-        Structured L2-norm pruning: remove the ``amount`` fraction of
-        output channels from each Conv2d / Linear layer.
+        Remove the ``amount`` fraction of output channels/features from
+        each non-final ``nn.Linear``/``nn.Conv2d`` layer in ``model``,
+        rebuilding it (and trimming the next prunable layer's input
+        dimension to match) rather than masking weights to zero.
+
+        The final prunable layer's output dimension is never touched —
+        it defines the model's output contract. Any child module that
+        isn't a prunable or recognized transparent type (notably any
+        normalization layer, which has per-channel parameters that would
+        also need trimming) raises ``NotImplementedError`` rather than
+        silently skipping it.
         """
-        target_types = self._target_layer_types()
-        for module in model.modules():
-            if isinstance(module, nn.Conv2d):
-                n_to_remove = max(1, int(module.out_channels * amount))
-                n_to_keep = max(1, module.out_channels - n_to_remove)
-                if n_to_keep < module.out_channels:
-                    prune.ln_structured(module, name="weight", amount=amount, n=2, dim=0)
-            elif isinstance(module, nn.Linear):
-                prune.l1_unstructured(module, name="weight", amount=amount)
+        if not isinstance(model, nn.Sequential):
+            raise NotImplementedError(
+                f"structured pruning requires nn.Sequential; got {type(model).__name__}"
+            )
 
-    def _make_permanent(self, model: "nn.Module") -> None:
-        """Remove pruning re-parametrizations, making the mask permanent."""
-        for module in model.modules():
-            if hasattr(module, "weight_orig"):
-                try:
-                    prune.remove(module, "weight")
-                except Exception:
-                    pass
+        children = list(model)
+        for child in children:
+            if not isinstance(child, _PRUNABLE_TYPES + _TRANSPARENT_TYPES):
+                raise NotImplementedError(
+                    "structured pruning requires nn.Sequential of "
+                    f"{[t.__name__ for t in _PRUNABLE_TYPES]} (with only "
+                    f"{[t.__name__ for t in _TRANSPARENT_TYPES]} in between); "
+                    f"got unsupported layer type {type(child).__name__}"
+                )
 
-    def _target_layer_types(self) -> Tuple:
-        types = []
-        if self.config.target_layers is None:
-            return (nn.Linear, nn.Conv2d)
-        for name in self.config.target_layers:
-            cls = getattr(nn, name, None)
-            if cls is not None:
-                types.append(cls)
-        return tuple(types) if types else (nn.Linear, nn.Conv2d)
+        prunable_indices = [i for i, c in enumerate(children) if isinstance(c, _PRUNABLE_TYPES)]
+        if not prunable_indices:
+            return model
+
+        carry_keep_idx: Optional["torch.Tensor"] = None
+        carry_block_size = 1
+
+        for pos, idx in enumerate(prunable_indices):
+            layer = children[idx]
+            is_last = pos == len(prunable_indices) - 1
+
+            if carry_keep_idx is None:
+                in_keep = None
+            elif carry_block_size == 1:
+                in_keep = carry_keep_idx
+            else:
+                in_keep = torch.cat([
+                    torch.arange(c * carry_block_size, (c + 1) * carry_block_size)
+                    for c in carry_keep_idx.tolist()
+                ])
+
+            if isinstance(layer, nn.Linear):
+                new_layer, out_keep = _rebuild_linear(layer, amount, in_keep, is_last)
+                carry_block_size = 1
+            else:
+                if layer.groups != 1:
+                    raise NotImplementedError(
+                        "structured pruning does not support grouped/depthwise "
+                        f"Conv2d (groups={layer.groups})"
+                    )
+                new_layer, out_keep = _rebuild_conv2d(layer, amount, in_keep, is_last)
+                next_idx = prunable_indices[pos + 1] if not is_last else None
+                if next_idx is not None and isinstance(children[next_idx], nn.Linear):
+                    next_in_features = children[next_idx].in_features
+                    if next_in_features % layer.out_channels != 0:
+                        raise NotImplementedError(
+                            "cannot map Conv2d output channels onto the next "
+                            f"Linear's in_features={next_in_features} (not a "
+                            f"multiple of out_channels={layer.out_channels}); "
+                            "unsupported reshape between Conv2d and Linear"
+                        )
+                    carry_block_size = next_in_features // layer.out_channels
+                else:
+                    carry_block_size = 1
+
+            model[idx] = new_layer
+            carry_keep_idx = out_keep
+
+        return model
+
+
+def _rebuild_linear(layer: "nn.Linear", amount: float, in_keep, is_last: bool):
+    W = layer.weight.data
+    b = layer.bias.data if layer.bias is not None else None
+    if in_keep is not None:
+        W = W[:, in_keep]
+    out_keep = _select_keep(W.reshape(W.shape[0], -1), amount, is_last)
+    new_layer = nn.Linear(W.shape[1], len(out_keep), bias=b is not None)
+    new_layer.weight.data = W[out_keep].clone()
+    if b is not None:
+        new_layer.bias.data = b[out_keep].clone()
+    return new_layer, out_keep
+
+
+def _rebuild_conv2d(layer: "nn.Conv2d", amount: float, in_keep, is_last: bool):
+    W = layer.weight.data
+    b = layer.bias.data if layer.bias is not None else None
+    if in_keep is not None:
+        W = W[:, in_keep]
+    out_keep = _select_keep(W.reshape(W.shape[0], -1), amount, is_last)
+    new_layer = nn.Conv2d(
+        W.shape[1], len(out_keep),
+        kernel_size=layer.kernel_size, stride=layer.stride,
+        padding=layer.padding, dilation=layer.dilation,
+        groups=1, bias=b is not None,
+    )
+    new_layer.weight.data = W[out_keep].clone()
+    if b is not None:
+        new_layer.bias.data = b[out_keep].clone()
+    return new_layer, out_keep
+
+
+def _select_keep(weight_2d: "torch.Tensor", amount: float, is_last: bool) -> "torch.Tensor":
+    """Return sorted indices of output rows to keep, by L2 norm."""
+    n_out = weight_2d.shape[0]
+    if is_last:
+        return torch.arange(n_out)
+    norms = weight_2d.norm(p=2, dim=1)
+    n_remove = int(n_out * amount)
+    n_keep = max(1, n_out - n_remove)
+    return norms.argsort(descending=True)[:n_keep].sort().values
 
 
 # ------------------------------------------------------------------
@@ -239,10 +332,6 @@ class RealPruner:
 
 def _count_params(model: "nn.Module") -> int:
     return sum(p.numel() for p in model.parameters())
-
-
-def _count_nonzero_params(model: "nn.Module") -> int:
-    return sum(p.nonzero().size(0) for p in model.parameters())
 
 
 def _model_size_mb(model: "nn.Module") -> float:

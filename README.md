@@ -18,9 +18,13 @@
 
 #### #2: Real Model Optimization Pipeline
 - PyTorch INT8 quantization and simulated INT4 weight rounding
-- **REAL pruning** (structured/unstructured)
+- **REAL structured pruning** — genuine channel/filter removal for `nn.Sequential` chains of
+  `Linear`/`Conv2d` (not just zeroing weights)
 - Target: 3-5x inference speedup (benchmark pending)
-- Target: 4-10x memory reduction (benchmark pending)
+- Structured pruning: up to ~`amount` fraction size reduction (configurable, verified empirically
+  — see `tests/test_smoke.py`). Unstructured pruning is not offered: on CPU, a sparse tensor's
+  index overhead only pays for itself above ~70-80% sparsity, which no predefined strategy
+  reaches, so there's no amount at which it would help
 - ONNX/TensorRT export
 - Designed for edge deployment (INT8 + ONNX export)
 
@@ -51,7 +55,7 @@ src/
     │   └── temporal_query.py     # Time-aware queries
     ├── amazon_robotics/          # Model Optimization
     │   ├── quantizer.py          # PyTorch INT8 / simulated INT4
-    │   ├── pruner.py             # Structured/unstructured pruning
+    │   ├── pruner.py             # Structured pruning (real channel removal); unstructured N/A on CPU
     │   ├── exporter.py           # ONNX/TensorRT
     │   └── real_optimizer.py     # Integrated pipeline
     └── orchestration/            # Workflow Engine
@@ -175,7 +179,9 @@ print(result['optimization_results'])
 
 ### Real Optimization
 - Target: 3-5x inference speedup (benchmark pending)
-- Target: 4-10x memory reduction (benchmark pending)
+- Structured pruning: up to ~`amount` fraction size reduction, verified empirically for
+  `nn.Sequential` Linear/Conv2d chains; unstructured pruning not supported on CPU (sparse-tensor
+  index overhead exceeds the savings below ~70-80% sparsity)
 - Target: <3% accuracy drop (validation harness pending)
 - **<10ms latency target** (edge deployment)
 - **<100MB size target** (edge deployment)
@@ -223,9 +229,17 @@ custom = OptimizationStrategy(
     quantization_type="dynamic_int8",
     use_pruning=True,
     pruning_amount=0.4,
+    pruning_method="structured_l2",  # see note below — the unstructured default isn't supported
     target_latency_ms=5.0
 )
 ```
+
+> **Note on pruning in the predefined strategies above:** `compact_prune` uses `structured_l2`
+> and gets real size reduction. `hybrid_moderate` and `aggressive` default to `unstructured_l1`,
+> which is not supported on CPU (see above) — their pruning step currently fails gracefully
+> (recorded as an error in the result; quantization still runs), so today they're effectively
+> quantization-only. Pass `pruning_method="structured_l2"` explicitly (as in the custom strategy
+> example) to get real pruning from a custom strategy.
 
 ---
 
