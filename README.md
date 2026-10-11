@@ -1,4 +1,4 @@
-# META-OPTIMIZER v7.0 - WORLD-CLASS EDITION
+# META-OPTIMIZER v7.0
 
 **AI System for Temporal Memory, Model Optimization and Workflow Orchestration**
 
@@ -274,11 +274,11 @@ print(f"Migrated {migration_stats['lessons']} lessons")
 
 ### Industry Research (2025)
 
-1. **Mem0**: "26% accuracy boost" — https://mem0.ai/research
-2. **Edge AI Survey**: PRISMA-aligned — https://www.mdpi.com/2079-9292/14/24/4877
-3. **QAP**: 50x compression — Journal of Computational Analysis 2025
-4. **LangGraph Guide**: https://www.langflow.org/blog/choosing-ai-agent-framework-2025
-5. **Temporal KG**: Zep architecture — https://www.emergentmind.com/topics/zep
+1. **Mem0**: "+26% accuracy vs. OpenAI Memory on the LOCOMO benchmark" — https://mem0.ai/research (arXiv:2504.19413)
+2. **Edge AI Survey**: PRISMA-aligned systematic review of DL deployment on embedded hardware — https://www.mdpi.com/2079-9292/14/24/4877
+3. **QAP (quantization-aware pruning)**: Hawks et al. (2021), *Frontiers in AI* — ~50x reduction in bit-operations (BOPs), not storage size — https://doi.org/10.3389/frai.2021.676564
+4. **AI Agent Framework Guide**: Langflow, "The Complete Guide to Choosing an AI Agent Framework in 2025" — https://www.langflow.org/blog/the-complete-guide-to-choosing-an-ai-agent-framework-in-2025
+5. **Temporal KG**: Zep — "A Temporal Knowledge Graph Architecture for Agent Memory" — https://arxiv.org/abs/2501.13956
 
 ---
 
