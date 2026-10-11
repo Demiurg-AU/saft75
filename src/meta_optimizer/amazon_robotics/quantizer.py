@@ -207,6 +207,19 @@ class RealQuantizer:
         Static INT8 quantization via torchao's PT2E flow — both weights
         and activations are quantized using scale factors calibrated
         from representative data.
+
+        Requires ``torch.export`` (torch>=2.1). Only ``backend="fbgemm"``
+        is supported — see the module docstring for why "qnnpack" raises.
+        The returned module is NOT state_dict-compatible with the
+        original: ``_drop_unused_attrs`` deletes the original float
+        ``*.weight`` entries (dead after conversion — see module
+        docstring), so keys like ``state_dict()["0.weight"]`` are gone
+        and ``converted[0].weight`` raises ``AttributeError``; the real
+        quantized weight lives under internal names such as
+        ``_frozen_param0``/``_scale_0`` instead. It also can't call
+        ``.train()``/``.eval()`` normally (``allow_exported_model_train_eval``
+        below patches those two methods onto this specific instance only
+        — it does not affect any other model in the process).
         """
         if not HAS_TORCHAO:
             raise ImportError("torchao is required. Install with: pip install torchao")

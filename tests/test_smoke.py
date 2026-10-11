@@ -55,7 +55,12 @@ def test_quantizer_static_int8():
     test_input = torch.randn(1, 100)
     result = quantizer.quantize(model, test_input)
     assert result.success, result.error
-    assert result.size_reduction > 0
+    # ~71% expected (int8/float32 storage ratio plus small scale/zero-point
+    # overhead). A narrow band, not just `> 0`, so a regression that makes
+    # this fall back to measuring unquantized size (0%) or that silently
+    # keeps the dead pre-quantization weight around (negative) both fail
+    # loudly instead of slipping through on a loose bound.
+    assert 0.6 < result.size_reduction < 0.8, result.size_reduction
     # The converted graph module must still run on fresh input afterwards.
     assert result.quantized_model(torch.randn(1, 100)).shape == (1, 10)
 
