@@ -5,6 +5,7 @@ Provides predefined strategies and a unified interface for model optimization.
 """
 from __future__ import annotations
 
+import copy
 import os
 import tempfile
 import time
@@ -21,6 +22,7 @@ except ImportError:
 from .quantizer import QuantizationConfig, RealQuantizer
 from .pruner import PruningConfig, RealPruner
 from .exporter import ExportConfig, ModelExporter
+from .fine_tuning import FineTuneConfig, fine_tune
 
 
 # ------------------------------------------------------------------
@@ -35,7 +37,8 @@ class OptimizationStrategy:
     quantization_type: str = "dynamic_int8"
     use_pruning: bool = False
     pruning_amount: float = 0.0
-    pruning_method: str = "unstructured_l1"
+    pruning_method: str = "structured_l2"
+    fine_tune: bool = False            # run fine_tune() on the pruned model before quantization
     export_onnx: bool = False
     target_latency_ms: float = 10.0
     target_size_mb: float = 100.0
@@ -58,18 +61,32 @@ PREDEFINED_STRATEGIES: Dict[str, OptimizationStrategy] = {
     "hybrid_moderate": OptimizationStrategy(
         name="hybrid_moderate",
         use_quantization=True,
-        quantization_type="dynamic_int8",
+        quantization_type="int8_weight_only_conv",
         use_pruning=True,
-        pruning_amount=0.20,
-        pruning_method="unstructured_l1",
+        pruning_amount=0.30,
+        pruning_method="structured_l2",
+        fine_tune=True,
     ),
     "aggressive": OptimizationStrategy(
         name="aggressive",
         use_quantization=True,
-        quantization_type="dynamic_int8",
+        quantization_type="int8_weight_only_conv",
         use_pruning=True,
         pruning_amount=0.50,
-        pruning_method="unstructured_l1",
+        pruning_method="structured_l2",
+        fine_tune=True,
+    ),
+    "fast_int8_conv_s1": OptimizationStrategy(
+        name="fast_int8_conv_s1",
+        use_quantization=True,
+        quantization_type="int8_weight_only_conv",
+        use_pruning=False,
+    ),
+    "fast_int8_conv_s2": OptimizationStrategy(
+        name="fast_int8_conv_s2",
+        use_quantization=True,
+        quantization_type="static_int8",
+        use_pruning=False,
     ),
 }
 
@@ -84,6 +101,7 @@ class PipelineResult:
     strategy_name: str
     quantization_result: Optional[Dict[str, Any]] = None
     pruning_result: Optional[Dict[str, Any]] = None
+    fine_tune_result: Optional[Dict[str, Any]] = None
     export_result: Optional[Dict[str, Any]] = None
     final_metrics: Dict[str, Any] = field(default_factory=dict)
     overall_success: bool = True
@@ -94,6 +112,7 @@ class PipelineResult:
             "strategy_name": self.strategy_name,
             "quantization_result": self.quantization_result,
             "pruning_result": self.pruning_result,
+            "fine_tune_result": self.fine_tune_result,
             "export_result": self.export_result,
             "final_metrics": self.final_metrics,
             "overall_success": self.overall_success,
@@ -130,6 +149,7 @@ class OptimizationPipeline:
         strategy: str = "hybrid_moderate",
         custom_strategy: Optional[OptimizationStrategy] = None,
         onnx_output_dir: Optional[str] = None,
+        fine_tune_config: Optional[FineTuneConfig] = None,
     ) -> Dict[str, Any]:
         """
         Optimize ``model`` using the specified strategy.
@@ -140,6 +160,14 @@ class OptimizationPipeline:
             strategy: Name of a predefined strategy.
             custom_strategy: Override with a custom OptimizationStrategy.
             onnx_output_dir: Directory for ONNX export (None = skip export).
+            fine_tune_config: Imagenette2-160 archive path/SHA-256 and
+                fine-tuning hyperparameters, used only when the strategy
+                declares ``fine_tune=True`` (``hybrid_moderate``,
+                ``aggressive``). ``None`` (the default) means no archive is
+                configured — ``fine_tune()`` then reports
+                ``status="NOT_AVAILABLE"`` rather than running, which per
+                A11-11 is recorded as a pipeline error (see Step 1.5 below),
+                not silently treated as success.
 
         Returns:
             PipelineResult dict with metrics and optimized model reference.
@@ -169,6 +197,18 @@ class OptimizationPipeline:
             else:
                 result.errors.append(f"Pruning failed: {pr.error}")
 
+        # --- Step 1.5: Fine-tuning (mandatory for strategies that declare
+        # it — hybrid_moderate/aggressive — run on the pruned float model,
+        # before quantization). Distills from a frozen copy of the
+        # original pre-pruning FP32 model — never the pruned student
+        # itself, and never updated. ---
+        if strat.fine_tune:
+            teacher_model = copy.deepcopy(model).eval()
+            ft = fine_tune(current_model, teacher_model, fine_tune_config or FineTuneConfig())
+            result.fine_tune_result = ft.to_dict()
+            if ft.status != "VERIFIED":
+                result.errors.append(f"Fine-tuning {ft.status}: {ft.error}")
+
         # --- Step 2: Quantization ---
         if strat.use_quantization:
             quantizer = RealQuantizer(
@@ -192,14 +232,14 @@ class OptimizationPipeline:
                 result.errors.append(f"ONNX export failed: {er.error}")
 
         # --- Aggregate final metrics ---
-        result.final_metrics = self._compute_final_metrics(result, model, current_model, test_input)
+        result.final_metrics = self._compute_final_metrics(strat, model, current_model, test_input)
         result.overall_success = len(result.errors) == 0
 
         return result.to_dict()
 
     def _compute_final_metrics(
         self,
-        result: PipelineResult,
+        strat: OptimizationStrategy,
         original_model: "nn.Module",
         final_model: "nn.Module",
         test_input: "torch.Tensor",
@@ -222,7 +262,8 @@ class OptimizationPipeline:
             "original_latency_ms": round(original_latency, 3),
             "final_latency_ms": round(final_latency, 3),
             "latency_improvement": round(latency_improvement, 2),
-            "meets_latency_target": final_latency <= result.final_metrics.get("target_latency_ms", float("inf")),
+            "meets_latency_target": final_latency <= strat.target_latency_ms,
+            "meets_size_target": final_size <= strat.target_size_mb,
         }
 
     def compare_strategies(

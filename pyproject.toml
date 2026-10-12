@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-optimizer"
+version = "7.0.0"
+description = "Temporal knowledge graph memory, PyTorch model optimization, and workflow orchestration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+]
+
+[project.optional-dependencies]
+optimization = [
+    "torch>=2.1",
+    "torchao>=0.18",
+    "numpy>=1.24",
+]
+onnx = [
+    "meta-optimizer[optimization]",
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+]
+export = [
+    "meta-optimizer[optimization]",
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+    "onnxscript>=0.1",
+]
+chromadb = [
+    "chromadb>=0.4",
+    "sentence-transformers>=2.2",
+]
+test = [
+    "pytest>=7.4",
+]
+all = [
+    "meta-optimizer[onnx,chromadb,test]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
