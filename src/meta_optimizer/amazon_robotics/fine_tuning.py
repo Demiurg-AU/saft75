@@ -24,14 +24,32 @@ The held-out accuracy control is a slice of Imagenette's TRAIN split
 (``FineTuneConfig.holdout_fraction``), never the val split — val is
 reserved for E1's own check elsewhere, so this module never reads it.
 
-If the model's current classifier head (its last ``nn.Linear``) doesn't
-already output Imagenette's class count (10), it's replaced with a fresh
-``nn.Linear`` of the right size — ordinary transfer-learning practice, not
-a hidden label remapping. A model with no ``nn.Linear`` at all (e.g. a
-PT2E/``static_int8`` ``GraphModule`` — see ``quantizer.py``'s
-``_static_int8`` docstring) has no classifier head to adapt and raises
-``NotImplementedError``, the same "this representation doesn't support
-that operation" pattern as ``serialization.py``'s sd+recipe.
+The model's classifier head is NEVER replaced — it stays the original
+1000-class ImageNet head throughout.
+
+Training uses knowledge distillation, not hard-label cross-entropy: the
+loss is ``KL(softmax(teacher_logits/T) || softmax(student_logits/T))``
+(``_distillation_loss``) over the full 1000-class output, T=1 by default,
+with the pre-pruning FP32 model as the frozen teacher (passed explicitly
+via ``fine_tune``'s ``teacher_model`` argument — ``eval()``'d, run under
+``torch.no_grad()``, never updated). Hard labels never appear in this
+loss at all — Imagenette's own 10 folder labels (``ImageFolder`` assigns
+them local indices 0-9, alphabetically by the synset folder name),
+translated to their real ImageNet-1000 index via
+``_IMAGENETTE_SYNSET_TO_IMAGENET_IDX``, are used *only* for
+``accuracy_before``/``accuracy_after`` on the held-out slice, never for
+anything the optimizer's gradient depends on. This also means training
+needs no notion of which 10 classes Imagenette covers at all — only
+evaluating the before/after accuracy numbers does.
+
+Preprocessing is ``MobileNet_V2_Weights.IMAGENET1K_V1.transforms()`` —
+the same preset E1 uses (224 center-crop, ImageNet normalization) — for
+anything being *measured* (the held-out control). Training is the same
+preset's own ``resize_size``/``crop_size``/``mean``/``std`` but with a
+random crop and a random horizontal flip substituted for the preset's
+deterministic resize+center-crop, since training benefits from those two
+augmentations and nothing else is introduced on top of the same
+normalization.
 
 CUDA is permitted (``FineTuneConfig.device="cuda"``) but is this caller's
 own responsibility to schedule — this module does nothing to detect or
@@ -44,7 +62,7 @@ import os
 import tarfile
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import torch
@@ -56,9 +74,28 @@ except ImportError:
 try:
     from torchvision import transforms
     from torchvision.datasets import ImageFolder
+    from torchvision.models import MobileNet_V2_Weights
     HAS_TORCHVISION = True
 except ImportError:
     HAS_TORCHVISION = False
+
+
+# Imagenette2-160's 10 synset folder names -> their real index in the
+# standard 1000-class ILSVRC ordering (caller-supplied, not independently
+# verifiable in this sandbox — see module docstring's archive-hash note
+# for the same "no way to confirm independently" situation).
+_IMAGENETTE_SYNSET_TO_IMAGENET_IDX: Dict[str, int] = {
+    "n01440764": 0,
+    "n02102040": 217,
+    "n02979186": 482,
+    "n03000684": 491,
+    "n03028079": 497,
+    "n03394916": 566,
+    "n03417042": 569,
+    "n03425413": 571,
+    "n03445777": 574,
+    "n03888257": 701,
+}
 
 
 @dataclass
@@ -70,6 +107,7 @@ class FineTuneConfig:
     holdout_fraction: float = 0.10     # fraction of TRAIN held out as a control, never val
     batch_size: int = 32
     learning_rate: float = 1e-4
+    temperature: float = 1.0           # distillation temperature T
     device: str = "cpu"                # "cpu" | "cuda"
     seed: int = 0
 
@@ -99,12 +137,26 @@ class FineTuneResult:
         }
 
 
-def fine_tune(model: "nn.Module", config: Optional[FineTuneConfig] = None) -> FineTuneResult:
+def fine_tune(
+    model: "nn.Module",
+    teacher_model: "nn.Module",
+    config: Optional[FineTuneConfig] = None,
+) -> FineTuneResult:
     """
-    Fine-tune ``model`` on Imagenette2-160's train split, reporting
-    accuracy on a held-out slice of train (never val) before and after.
+    Fine-tune ``model`` via distillation from ``teacher_model`` on
+    Imagenette2-160's train split, reporting accuracy on a held-out slice
+    of train (never val) before and after.
 
-    See the module docstring for the NOT_AVAILABLE/ERROR status contract.
+    Args:
+        model: the student — typically the pruned model, about to be
+            quantized.
+        teacher_model: the frozen reference the student is distilled
+            towards — the pre-pruning FP32 model. Never updated; always
+            run in ``eval()`` under ``torch.no_grad()``.
+        config: see ``FineTuneConfig``.
+
+    See the module docstring for the NOT_AVAILABLE/ERROR status contract
+    and the distillation loss (no hard labels).
     """
     config = config or FineTuneConfig()
     if not HAS_TORCH:
@@ -128,56 +180,64 @@ def fine_tune(model: "nn.Module", config: Optional[FineTuneConfig] = None) -> Fi
             ),
         )
 
-    linears = [(name, m) for name, m in model.named_modules() if isinstance(m, nn.Linear)]
-    if not linears:
-        return FineTuneResult(
-            status="ERROR",
-            archive_sha256=actual_sha256,
-            error=(
-                f"{type(model).__name__} has no nn.Linear classifier head to adapt/fine-tune "
-                "(e.g. a PT2E/static_int8 GraphModule — see quantizer.py's _static_int8 docstring)"
-            ),
+    try:
+        extract_dir = tempfile.mkdtemp(prefix="imagenette2-160-")
+        with tarfile.open(config.archive_path, "r:*") as tar:
+            tar.extractall(extract_dir, filter="data")
+        train_dir = _find_train_dir(extract_dir)
+
+        train_transform, eval_transform = _build_transforms()
+        # Two ImageFolder instances over the identical directory produce
+        # identical `samples`/`classes` ordering — only their transform
+        # differs — so splitting by index keeps a holdout sample's image
+        # paired with the eval (non-augmented) transform and a train
+        # sample's paired with the augmented one.
+        meta_dataset = ImageFolder(train_dir)
+        label_map = _build_imagenet_label_map(meta_dataset.classes)
+
+        generator = torch.Generator().manual_seed(config.seed)
+        n_samples = len(meta_dataset)
+        shuffled = torch.randperm(n_samples, generator=generator).tolist()
+        n_holdout = max(1, int(n_samples * config.holdout_fraction))
+        n_train = n_samples - n_holdout
+        train_indices, holdout_indices = shuffled[:n_train], shuffled[n_train:]
+
+        train_dataset = ImageFolder(train_dir, transform=train_transform)
+        eval_dataset = ImageFolder(train_dir, transform=eval_transform)
+        train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+        holdout_subset = torch.utils.data.Subset(eval_dataset, holdout_indices)
+
+        device = torch.device(config.device)
+        model = model.to(device)
+        teacher_model = teacher_model.to(device)
+        teacher_model.eval()
+        # label_map stays on CPU — labels arrive from the DataLoader on
+        # CPU too, so indexing happens before the .to(device) move below.
+        # Used only for accuracy_before/after, never for the training loss.
+
+        accuracy_before = _evaluate_accuracy(model, holdout_subset, config.batch_size, device, label_map)
+
+        train_loader = torch.utils.data.DataLoader(
+            train_subset, batch_size=config.batch_size, shuffle=True, generator=generator,
         )
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
-    extract_dir = tempfile.mkdtemp(prefix="imagenette2-160-")
-    with tarfile.open(config.archive_path, "r:*") as tar:
-        tar.extractall(extract_dir, filter="data")
+        model.train()
+        for _ in range(config.epochs):
+            for images, _labels in train_loader:
+                images = images.to(device)
+                with torch.no_grad():
+                    teacher_logits = teacher_model(images)
+                optimizer.zero_grad()
+                student_logits = model(images)
+                loss = _distillation_loss(student_logits, teacher_logits, config.temperature)
+                loss.backward()
+                optimizer.step()
+        model.eval()
 
-    train_dir = _find_train_dir(extract_dir)
-    transform = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTensor()])
-    full_train = ImageFolder(train_dir, transform=transform)
-
-    _adapt_classifier_head(model, linears, len(full_train.classes))
-
-    generator = torch.Generator().manual_seed(config.seed)
-    n_holdout = max(1, int(len(full_train) * config.holdout_fraction))
-    n_train = len(full_train) - n_holdout
-    train_subset, holdout_subset = torch.utils.data.random_split(
-        full_train, [n_train, n_holdout], generator=generator,
-    )
-
-    device = torch.device(config.device)
-    model = model.to(device)
-
-    accuracy_before = _evaluate_accuracy(model, holdout_subset, config.batch_size, device)
-
-    train_loader = torch.utils.data.DataLoader(
-        train_subset, batch_size=config.batch_size, shuffle=True, generator=generator,
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    criterion = nn.CrossEntropyLoss()
-
-    model.train()
-    for _ in range(config.epochs):
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(images), labels)
-            loss.backward()
-            optimizer.step()
-    model.eval()
-
-    accuracy_after = _evaluate_accuracy(model, holdout_subset, config.batch_size, device)
+        accuracy_after = _evaluate_accuracy(model, holdout_subset, config.batch_size, device, label_map)
+    except Exception as exc:
+        return FineTuneResult(status="ERROR", archive_sha256=actual_sha256, error=str(exc))
 
     return FineTuneResult(
         status="VERIFIED",
@@ -190,17 +250,57 @@ def fine_tune(model: "nn.Module", config: Optional[FineTuneConfig] = None) -> Fi
     )
 
 
-def _adapt_classifier_head(model: "nn.Module", linears, num_classes: int) -> None:
-    """Replace the last nn.Linear with a fresh one if its size doesn't match."""
-    name, last_linear = linears[-1]
-    if last_linear.out_features == num_classes:
-        return
-    new_linear = nn.Linear(last_linear.in_features, num_classes)
-    *path, leaf = name.split(".")
-    parent = model
-    for part in path:
-        parent = getattr(parent, part)
-    setattr(parent, leaf, new_linear)
+def _distillation_loss(
+    student_logits: "torch.Tensor",
+    teacher_logits: "torch.Tensor",
+    temperature: float = 1.0,
+) -> "torch.Tensor":
+    """
+    ``KL(softmax(teacher_logits/T) || softmax(student_logits/T))`` over
+    the full 1000-class output. Takes only logits and a temperature — no
+    labels, hard or otherwise, appear anywhere in its signature or body.
+    """
+    teacher_probs = torch.softmax(teacher_logits / temperature, dim=1).detach()
+    student_log_probs = torch.log_softmax(student_logits / temperature, dim=1)
+    return torch.nn.functional.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
+
+def _build_imagenet_label_map(classes: List[str]) -> "torch.Tensor":
+    """
+    Map ``ImageFolder.classes`` (Imagenette's synset folder names, in the
+    local 0..9 index order ``ImageFolder`` assigned them) to their real
+    ImageNet-1000 index. Returns a LongTensor ``t`` such that
+    ``t[local_label]`` is the correct 1000-class index — raises if any
+    folder name isn't one of Imagenette's 10 known synsets, rather than
+    silently mapping it to the wrong class.
+    """
+    try:
+        imagenet_indices = [_IMAGENETTE_SYNSET_TO_IMAGENET_IDX[synset] for synset in classes]
+    except KeyError as exc:
+        raise ValueError(
+            f"unrecognized Imagenette synset folder {exc.args[0]!r} — not one of the "
+            f"10 known synsets {sorted(_IMAGENETTE_SYNSET_TO_IMAGENET_IDX)}"
+        ) from exc
+    return torch.tensor(imagenet_indices, dtype=torch.long)
+
+
+def _build_transforms():
+    """
+    Returns (train_transform, eval_transform). ``eval_transform`` is
+    exactly ``MobileNet_V2_Weights.IMAGENET1K_V1.transforms()`` — the same
+    preset E1 uses. ``train_transform`` uses that preset's own
+    resize_size/crop_size/mean/std but substitutes a random crop and a
+    random horizontal flip for the preset's deterministic resize+center-crop.
+    """
+    eval_transform = MobileNet_V2_Weights.IMAGENET1K_V1.transforms()
+    train_transform = transforms.Compose([
+        transforms.Resize(eval_transform.resize_size[0]),
+        transforms.RandomCrop(eval_transform.crop_size[0]),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=eval_transform.mean, std=eval_transform.std),
+    ])
+    return train_transform, eval_transform
 
 
 def _find_train_dir(extract_dir: str) -> str:
@@ -210,14 +310,14 @@ def _find_train_dir(extract_dir: str) -> str:
     raise FileNotFoundError(f"no 'train' directory found under extracted archive at {extract_dir}")
 
 
-def _evaluate_accuracy(model: "nn.Module", dataset, batch_size: int, device) -> float:
+def _evaluate_accuracy(model: "nn.Module", dataset, batch_size: int, device, label_map: "torch.Tensor") -> float:
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device), label_map[labels].to(device)
             preds = model(images).argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)

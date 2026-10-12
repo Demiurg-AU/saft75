@@ -649,14 +649,182 @@ def test_fine_tune_not_available_without_archive():
     from meta_optimizer.amazon_robotics import FineTuneConfig, fine_tune
 
     model = torch.nn.Sequential(torch.nn.Linear(10, 5), torch.nn.ReLU(), torch.nn.Linear(5, 2))
-    result = fine_tune(model, FineTuneConfig(archive_path="/nonexistent/imagenette2-160.tgz"))
+    teacher = torch.nn.Sequential(torch.nn.Linear(10, 5), torch.nn.ReLU(), torch.nn.Linear(5, 2))
+    result = fine_tune(model, teacher, FineTuneConfig(archive_path="/nonexistent/imagenette2-160.tgz"))
     assert result.status == "NOT_AVAILABLE"
     assert result.accuracy_before is None
     assert result.accuracy_after is None
 
     # No archive_path configured at all must behave the same way, not crash.
-    result = fine_tune(model, FineTuneConfig())
+    result = fine_tune(model, teacher, FineTuneConfig())
     assert result.status == "NOT_AVAILABLE"
+
+
+def test_build_imagenet_label_map_translates_synsets_to_imagenet_indices():
+    """
+    fine_tune() must never replace the model's classifier head — Imagenette's
+    own 10 folder labels are translated to their real ImageNet-1000 index
+    instead, so loss/accuracy stay over the full 1000-class output (the
+    same output space E1's own val check uses). This is a direct unit
+    check on that translation table, independent of the full archive
+    pipeline.
+    """
+    pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics.fine_tuning import _build_imagenet_label_map
+
+    classes = [
+        "n01440764", "n02102040", "n02979186", "n03000684", "n03028079",
+        "n03394916", "n03417042", "n03425413", "n03445777", "n03888257",
+    ]
+    label_map = _build_imagenet_label_map(classes)
+    assert label_map.tolist() == [0, 217, 482, 491, 497, 566, 569, 571, 574, 701]
+
+    with pytest.raises(ValueError, match="unrecognized Imagenette synset"):
+        _build_imagenet_label_map(["n01440764", "not-a-real-synset"])
+
+
+def test_fine_tune_preserves_classifier_head_and_imagenet_labels(tmp_path):
+    """
+    End-to-end happy path on a small, locally-generated fake
+    Imagenette2-160-shaped archive (real synset folder names, tiny
+    synthetic images) — not NOT_AVAILABLE, the actual training/eval code
+    path. Verifies: (1) the classifier head is untouched (still 1000
+    classes) after fine_tune(), and (2) training/eval complete without a
+    label-index error in the accuracy computation (the only place labels
+    are used at all — see test_distillation_loss_ignores_labels for the
+    training loss itself) — a fake dataset is enough to prove the
+    plumbing, the real accuracy numbers remain CLAIMED until a real
+    archive is used on XMG.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    import tarfile
+    from PIL import Image
+    from meta_optimizer.amazon_robotics import FineTuneConfig, fine_tune
+
+    synsets = ["n01440764", "n02102040", "n02979186"]
+    root = tmp_path / "imagenette2-160"
+    for synset in synsets:
+        d = root / "train" / synset
+        d.mkdir(parents=True)
+        for i in range(4):
+            Image.new("RGB", (160, 160), color=(i * 10, i * 20, i * 30)).save(d / f"{synset}_{i}.JPEG")
+
+    archive_path = tmp_path / "imagenette2-160.tgz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(root, arcname="imagenette2-160")
+    sha256 = __import__("hashlib").sha256(archive_path.read_bytes()).hexdigest()
+
+    # A cheap 1000-class classifier head — fine_tune() only cares that it's
+    # an nn.Module accepting [B,3,224,224] and producing [B,1000] logits.
+    def build_model():
+        return torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, kernel_size=3, stride=4),
+            torch.nn.ReLU(),
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Flatten(),
+            torch.nn.Linear(4, 1000),
+        )
+
+    model = build_model()
+    teacher = build_model()
+
+    result = fine_tune(model, teacher, FineTuneConfig(
+        archive_path=str(archive_path), expected_sha256=sha256,
+        epochs=1, holdout_fraction=0.34, batch_size=4,
+    ))
+    assert result.status == "VERIFIED", result.error
+    assert model[-1].out_features == 1000
+    assert result.accuracy_before is not None
+    assert result.accuracy_after is not None
+
+
+def test_distillation_loss_ignores_labels():
+    """
+    _distillation_loss's signature is (student_logits, teacher_logits,
+    temperature) — there is no parameter through which a label, hard or
+    otherwise, could reach it. Correctness checked against a manual
+    KL(softmax(teacher) || softmax(student)) computation at T=1.
+    """
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics.fine_tuning import _distillation_loss
+    import inspect
+
+    params = list(inspect.signature(_distillation_loss).parameters)
+    assert params == ["student_logits", "teacher_logits", "temperature"]
+
+    torch.manual_seed(0)
+    student_logits = torch.randn(8, 1000)
+    teacher_logits = torch.randn(8, 1000)
+
+    loss = _distillation_loss(student_logits, teacher_logits, temperature=1.0)
+
+    teacher_probs = torch.softmax(teacher_logits, dim=1)
+    manual = (teacher_probs * (torch.log(teacher_probs) - torch.log_softmax(student_logits, dim=1))).sum(dim=1).mean()
+    assert torch.allclose(loss, manual, atol=1e-5), (loss.item(), manual.item())
+
+
+def test_fine_tune_training_result_unaffected_by_garbage_labels(tmp_path, monkeypatch):
+    """
+    The training loss is pure distillation (student vs. frozen teacher
+    logits) — Imagenette's synset->ImageNet-index labels are used only
+    for accuracy_before/after, never for anything the optimizer's
+    gradient depends on. Proven here by swapping in a deliberately WRONG
+    synset->index mapping for a second run and checking the trained
+    weights come out bit-identical to the first (same archive, same seed,
+    same initial weights) — if labels leaked into the loss anywhere, a
+    wrong mapping would change the loss values and the weights would
+    diverge. accuracy_before/after legitimately differ between the two
+    runs (different "correct" index for the same images) — only the
+    trained weights are asserted equal.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    import copy
+    import tarfile
+    from PIL import Image
+    from meta_optimizer.amazon_robotics import FineTuneConfig, fine_tune
+    import meta_optimizer.amazon_robotics.fine_tuning as fine_tuning_module
+
+    synsets = ["n01440764", "n02102040", "n02979186"]
+    root = tmp_path / "imagenette2-160"
+    for synset in synsets:
+        d = root / "train" / synset
+        d.mkdir(parents=True)
+        for i in range(4):
+            Image.new("RGB", (160, 160), color=(i * 10, i * 20, i * 30)).save(d / f"{synset}_{i}.JPEG")
+
+    archive_path = tmp_path / "imagenette2-160.tgz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(root, arcname="imagenette2-160")
+    sha256 = __import__("hashlib").sha256(archive_path.read_bytes()).hexdigest()
+
+    torch.manual_seed(0)
+    model_a = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 4, kernel_size=3, stride=4), torch.nn.ReLU(),
+        torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten(), torch.nn.Linear(4, 1000),
+    )
+    model_b = copy.deepcopy(model_a)
+    teacher = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 4, kernel_size=3, stride=4), torch.nn.ReLU(),
+        torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten(), torch.nn.Linear(4, 1000),
+    )
+    config = FineTuneConfig(
+        archive_path=str(archive_path), expected_sha256=sha256,
+        epochs=1, holdout_fraction=0.34, batch_size=4, seed=0,
+    )
+
+    result_a = fine_tune(model_a, copy.deepcopy(teacher), config)
+    assert result_a.status == "VERIFIED", result_a.error
+
+    garbage_map = {synset: 999 - i for i, synset in enumerate(synsets)}
+    monkeypatch.setattr(fine_tuning_module, "_IMAGENETTE_SYNSET_TO_IMAGENET_IDX", garbage_map)
+    result_b = fine_tune(model_b, copy.deepcopy(teacher), config)
+    assert result_b.status == "VERIFIED", result_b.error
+
+    for (name_a, p_a), (name_b, p_b) in zip(model_a.state_dict().items(), model_b.state_dict().items()):
+        assert name_a == name_b
+        assert torch.equal(p_a, p_b), f"{name_a} diverged — labels leaked into the training loss"
 
 
 def test_pipeline_readme_quick_start():
