@@ -26,6 +26,13 @@ Implements:
   "does not support device 'cpu' yet", and ``tile_packed_to_4d``
   requires a CUDA driver). There is no portable real INT4 kernel path
   for this library's CPU-first CI, so this method stays as-is.
+- INT8 weight-only quantization with 1x1 conv coverage — ``dynamic_int8``/
+  ``static_int8`` above never touch plain ``nn.Conv2d`` layers in eager
+  mode; this method first converts every 1x1 conv to an equivalent
+  ``nn.Linear`` (torchao's ``swap_conv2d_1x1_to_linear``) so the
+  pointwise convs that dominate MobileNetV2's depthwise-separable blocks
+  get quantized too, then applies ``Int8WeightOnlyConfig`` to every
+  ``nn.Linear`` (original and swapped alike).
 """
 from __future__ import annotations
 
@@ -42,7 +49,12 @@ except ImportError:
     HAS_TORCH = False
 
 try:
-    from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfig
+    from torchao.quantization import (
+        quantize_,
+        Int8DynamicActivationInt8WeightConfig,
+        Int8WeightOnlyConfig,
+        swap_conv2d_1x1_to_linear,
+    )
     from torchao.quantization.pt2e import allow_exported_model_train_eval
     from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
     from torchao.quantization.pt2e.quantizer.x86_inductor_quantizer import (
@@ -57,7 +69,7 @@ except ImportError:
 @dataclass
 class QuantizationConfig:
     """Configuration for a quantization pass."""
-    method: str = "dynamic_int8"      # dynamic_int8 | static_int8 | int4_weight
+    method: str = "dynamic_int8"      # dynamic_int8 | static_int8 | int4_weight | int8_weight_only_conv
     dtype: str = "int8"               # int8 | int4
     per_channel: bool = True
     calibration_batches: int = 10
@@ -150,6 +162,8 @@ class RealQuantizer:
                 q_model = self._static_int8(model, test_input)
             elif method == "int4_weight":
                 q_model = self._int4_weight_only(model)
+            elif method == "int8_weight_only_conv":
+                q_model = self._int8_weight_only_conv(model)
             else:
                 raise ValueError(f"Unknown quantization method: {method}")
 
@@ -307,6 +321,36 @@ class RealQuantizer:
                     if scale > 0:
                         w_q = torch.clamp(torch.round((w - w_min) / scale), 0, 15)
                         module.weight.data = (w_q * scale + w_min).to(module.weight.dtype)
+        return m
+
+    def _int8_weight_only_conv(self, model: "nn.Module") -> "nn.Module":
+        """
+        INT8 weight-only quantization with 1x1 conv coverage — first
+        converts every 1x1 ``nn.Conv2d`` to an equivalent ``nn.Linear``
+        (torchao's ``swap_conv2d_1x1_to_linear``, which mutates the
+        model in place and returns ``None``), then applies
+        ``Int8WeightOnlyConfig`` to every ``nn.Linear`` — both the
+        original ones and the newly-swapped convs. Activations stay
+        float32 at inference; only weights are quantized.
+
+        Like ``_dynamic_int8``, the result stays state_dict-loadable
+        (torchao's eager-mode path, not a ``torch.export`` GraphModule),
+        but the module structure itself changes: each swapped 1x1 conv
+        becomes a ``PermuteSandwich`` wrapping an ``nn.Linear``, so
+        state_dict keys change too (e.g. ``"3.conv.0.weight"`` becomes
+        ``"3.conv.0.mod.weight"``). ``save_sd_recipe``/``load_sd_recipe``
+        (see ``serialization.py``) handle this like any other structural
+        transform: the caller's ``build_meta_skeleton`` must apply
+        ``swap_conv2d_1x1_to_linear`` to the meta skeleton too, not just
+        reuse the original float architecture unchanged.
+        """
+        if not HAS_TORCHAO:
+            raise ImportError("torchao is required. Install with: pip install torchao")
+        import copy
+        m = copy.deepcopy(model)
+        m.eval()
+        swap_conv2d_1x1_to_linear(m)
+        quantize_(m, Int8WeightOnlyConfig())
         return m
 
 

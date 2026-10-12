@@ -18,9 +18,11 @@
 
 #### #2: Real Model Optimization Pipeline
 - PyTorch INT8 quantization and simulated INT4 weight rounding
-- **REAL pruning** (structured/unstructured)
-- Target: 3-5x inference speedup (benchmark pending)
-- Target: 4-10x memory reduction (benchmark pending)
+- **REAL structured pruning** — physical channel removal (not masking),
+  generalized to nested CNN architectures (BatchNorm, depthwise conv)
+- Optional post-pruning fine-tuning on Imagenette2-160
+- Target: 3-5x inference speedup — Не достигнуто, см. REPORT.md
+- Target: 4-10x memory reduction — Не достигнуто, см. REPORT.md
 - ONNX/TensorRT export
 - Designed for edge deployment (INT8 + ONNX export)
 
@@ -51,7 +53,8 @@ src/
     │   └── temporal_query.py     # Time-aware queries
     ├── amazon_robotics/          # Model Optimization
     │   ├── quantizer.py          # PyTorch INT8 / simulated INT4
-    │   ├── pruner.py             # Structured/unstructured pruning
+    │   ├── pruner.py             # Structured pruning (real channel removal)
+    │   ├── fine_tuning.py        # Post-pruning fine-tuning (Imagenette2-160)
     │   ├── exporter.py           # ONNX/TensorRT
     │   └── real_optimizer.py     # Integrated pipeline
     └── orchestration/            # Workflow Engine
@@ -174,9 +177,9 @@ print(result['optimization_results'])
 - **Temporal queries** — "when did we last optimize X?"
 
 ### Real Optimization
-- Target: 3-5x inference speedup (benchmark pending)
-- Target: 4-10x memory reduction (benchmark pending)
-- Target: <3% accuracy drop (validation harness pending)
+- Target: 3-5x inference speedup — Не достигнуто, см. REPORT.md
+- Target: 4-10x memory reduction — Не достигнуто, см. REPORT.md
+- Target: <3% accuracy drop — Не достигнуто (как совместное условие со сжатием/ускорением), см. REPORT.md
 - **<10ms latency target** (edge deployment)
 - **<100MB size target** (edge deployment)
 
@@ -208,10 +211,10 @@ tkg = TemporalKnowledgeGraph(
 ```python
 # Predefined strategies
 strategies = {
-    "fast_int8": "Quick INT8 quantization",
-    "compact_prune": "30% structured pruning",
-    "hybrid_moderate": "INT8 + 20% pruning",
-    "aggressive": "INT8 + 50% pruning"
+    "fast_int8": "Quick INT8 quantization (dynamic, Linear-only)",
+    "compact_prune": "30% structured pruning, no quantization",
+    "hybrid_moderate": "30% structured pruning + INT8 weight-only (1x1-conv-aware)",
+    "aggressive": "50% structured pruning + INT8 weight-only (1x1-conv-aware)",
 }
 
 # Custom strategy
@@ -283,4 +286,4 @@ print(f"Migrated {migration_stats['lessons']} lessons")
 ---
 
 **Version:** 7.0.0
-**Status:** Alpha — packaging and CI smoke tests in place, benchmarks pending
+**Status:** Alpha — packaging and CI smoke tests in place; real E1/E2 benchmark run completed, see REPORT.md (headline compression/speedup targets not met; accuracy gate passed individually by most strategies, not as a combined gate by any)
