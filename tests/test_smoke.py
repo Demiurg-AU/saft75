@@ -911,3 +911,30 @@ def test_workflow_readme_quick_start():
     )
     assert "success" in result
     assert "optimization_results" in result
+
+
+def test_workflow_engine_uses_node_fallback():
+    from meta_optimizer.orchestration.workflow_engine import WorkflowEngine, NodeType
+    from meta_optimizer.orchestration.error_handler import ErrorHandler, RetryConfig
+
+    def always_fails(context):
+        raise RuntimeError("simulated failure")
+
+    def baseline_fallback(context):
+        context["degraded"] = True
+        return context
+
+    engine = WorkflowEngine(error_handler=ErrorHandler(RetryConfig(max_attempts=2, initial_delay_s=0)))
+    engine.add_node("start", NodeType.START, lambda ctx: ctx)
+    engine.add_node("flaky", NodeType.PROCESS, always_fails, fallback=baseline_fallback)
+    engine.add_node("end", NodeType.END, lambda ctx: ctx)
+    engine.add_edge("start", "flaky")
+    engine.add_edge("flaky", "end")
+
+    result = engine.run()
+    # Without the fallback wired through, this node's failure would be
+    # caught by WorkflowEngine.run's except block instead and recorded
+    # under _workflow["errors"] — the fallback being used means the
+    # handler's RuntimeError never reaches that except block at all.
+    assert result.get("degraded") is True
+    assert result["_workflow"]["errors"] == []
