@@ -13,6 +13,7 @@ from .real_optimizer import (
     PREDEFINED_STRATEGIES,
 )
 from .serialization import SdRecipe, save_sd_recipe, load_sd_recipe
+from .fine_tuning import FineTuneConfig, FineTuneResult, fine_tune
 
 __all__ = [
     "RealQuantizer",
@@ -31,4 +32,7 @@ __all__ = [
     "SdRecipe",
     "save_sd_recipe",
     "load_sd_recipe",
+    "FineTuneConfig",
+    "FineTuneResult",
+    "fine_tune",
 ]
