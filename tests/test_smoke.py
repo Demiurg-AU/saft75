@@ -83,6 +83,44 @@ def test_pipeline_readme_quick_start():
     assert "overall_success" in results
 
 
+def test_meets_latency_target_checks_actual_target():
+    """Regression test for issue #7: meets_latency_target was always True
+    because it compared against an empty dict instead of the strategy's
+    own target_latency_ms/target_size_mb."""
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics import OptimizationPipeline, OptimizationStrategy
+
+    pipeline = OptimizationPipeline()
+    model = torch.nn.Sequential(
+        torch.nn.Linear(100, 50),
+        torch.nn.ReLU(),
+        torch.nn.Linear(50, 10),
+    )
+    test_input = torch.randn(1, 100)
+
+    impossible = OptimizationStrategy(
+        name="impossible_target",
+        use_quantization=False,
+        use_pruning=False,
+        target_latency_ms=1e-9,
+        target_size_mb=1e-9,
+    )
+    result = pipeline.optimize(model=model, test_input=test_input, custom_strategy=impossible)
+    assert result["final_metrics"]["meets_latency_target"] is False
+    assert result["final_metrics"]["meets_size_target"] is False
+
+    easy = OptimizationStrategy(
+        name="easy_target",
+        use_quantization=False,
+        use_pruning=False,
+        target_latency_ms=1e9,
+        target_size_mb=1e9,
+    )
+    result = pipeline.optimize(model=model, test_input=test_input, custom_strategy=easy)
+    assert result["final_metrics"]["meets_latency_target"] is True
+    assert result["final_metrics"]["meets_size_target"] is True
+
+
 def test_workflow_visualize():
     pytest.importorskip("torch")
     from meta_optimizer.orchestration import MetaOptimizerWorkflow
