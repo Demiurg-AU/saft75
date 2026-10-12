@@ -31,6 +31,46 @@ def test_tkg_readme_quick_start():
     tkg.when_was_last("model optimization")
 
 
+def test_tkg_what_changed_since_catches_updates():
+    from datetime import datetime, timedelta, timezone
+    from meta_optimizer.temporal_memory import EntityType, TemporalKnowledgeGraph
+
+    tkg = TemporalKnowledgeGraph()
+    node_id = tkg.add_knowledge("Old fact created long ago", EntityType.GENERIC)
+
+    node = tkg._graph.get_node(node_id)
+    node.created_at = datetime.now(timezone.utc) - timedelta(days=100)
+    node.updated_at = datetime.now(timezone.utc) - timedelta(days=100)
+
+    tkg.update_knowledge(node_id, {"status": "just updated today"})
+
+    changed = tkg.what_changed_since(days_ago=7)
+    assert any(r["node_id"] == node_id for r in changed)
+
+    related = tkg._temporal.find_related_in_timeframe("Old fact", days_ago=7)
+    assert any(r["node_id"] == node_id for r in related)
+
+
+def test_tkg_get_timeline_still_filters_by_created_at():
+    from datetime import datetime, timedelta, timezone
+    from meta_optimizer.temporal_memory import EntityType, TemporalKnowledgeGraph
+
+    tkg = TemporalKnowledgeGraph()
+    node_id = tkg.add_knowledge("Old fact created long ago", EntityType.GENERIC)
+
+    node = tkg._graph.get_node(node_id)
+    node.created_at = datetime.now(timezone.utc) - timedelta(days=100)
+    node.updated_at = datetime.now(timezone.utc) - timedelta(days=100)
+
+    # Updating it recently must NOT make it appear in a timeline window
+    # that only covers the last 7 days — get_timeline's contract is
+    # "created within", unlike what_changed_since's "created or updated".
+    tkg.update_knowledge(node_id, {"status": "just updated today"})
+
+    timeline = tkg.get_timeline(start=datetime.now(timezone.utc) - timedelta(days=7))
+    assert not any(r["node_id"] == node_id for r in timeline)
+
+
 def test_quantizer_readme_testing_example():
     torch = pytest.importorskip("torch")
     from meta_optimizer.amazon_robotics import QuantizationConfig, RealQuantizer
