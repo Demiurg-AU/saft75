@@ -71,6 +71,18 @@ PREDEFINED_STRATEGIES: Dict[str, OptimizationStrategy] = {
         pruning_amount=0.50,
         pruning_method="unstructured_l1",
     ),
+    "fast_int8_conv_s1": OptimizationStrategy(
+        name="fast_int8_conv_s1",
+        use_quantization=True,
+        quantization_type="int8_weight_only_conv",
+        use_pruning=False,
+    ),
+    "fast_int8_conv_s2": OptimizationStrategy(
+        name="fast_int8_conv_s2",
+        use_quantization=True,
+        quantization_type="static_int8",
+        use_pruning=False,
+    ),
 }
 
 
