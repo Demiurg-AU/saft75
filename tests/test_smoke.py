@@ -41,6 +41,107 @@ def test_quantizer_readme_testing_example():
     assert isinstance(quantizer.quantize(model, test_input).to_dict(), dict)
 
 
+def test_structured_prune_linear_chain():
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics import PruningConfig, RealPruner
+
+    pruner = RealPruner(PruningConfig(method="structured_l2", amount=0.3))
+    model = torch.nn.Sequential(torch.nn.Linear(100, 50), torch.nn.ReLU(), torch.nn.Linear(50, 10))
+    test_input = torch.randn(4, 100)
+    orig_out = model(test_input)
+
+    result = pruner.prune(model, test_input)
+    assert result.success, result.error
+    # The first (non-final) Linear's out_features should have shrunk ~30%.
+    assert 0.2 < result.size_reduction < 0.4, result.size_reduction
+
+    pruned_out = result.pruned_model(test_input)
+    # The final layer's output shape is the model's contract — it must not change.
+    assert pruned_out.shape == orig_out.shape
+
+
+def test_structured_prune_conv_chain():
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics import PruningConfig, RealPruner
+
+    pruner = RealPruner(PruningConfig(method="structured_l2", amount=0.25))
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.Conv2d(16, 8, kernel_size=3, padding=1),
+    )
+    test_input = torch.randn(2, 3, 8, 8)
+    orig_out = model(test_input)
+
+    result = pruner.prune(model, test_input)
+    assert result.success, result.error
+    assert 0.15 < result.size_reduction < 0.35, result.size_reduction
+
+    pruned_out = result.pruned_model(test_input)
+    assert pruned_out.shape == orig_out.shape
+
+
+def test_structured_prune_conv_flatten_linear():
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics import PruningConfig, RealPruner
+
+    pruner = RealPruner(PruningConfig(method="structured_l2", amount=0.25))
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.Flatten(),
+        torch.nn.Linear(16 * 8 * 8, 10),
+    )
+    test_input = torch.randn(2, 3, 8, 8)
+    orig_out = model(test_input)
+
+    result = pruner.prune(model, test_input)
+    assert result.success, result.error
+    assert 0.15 < result.size_reduction < 0.35, result.size_reduction
+
+    # Confirms the channel -> flatten-index block mapping lines up correctly;
+    # a wrong mapping would mix channels and produce garbage, not a crash.
+    pruned_out = result.pruned_model(test_input)
+    assert pruned_out.shape == orig_out.shape
+
+
+def test_structured_prune_rejects_non_sequential():
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics import PruningConfig, RealPruner
+
+    class Residual(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = torch.nn.Linear(10, 10)
+
+        def forward(self, x):
+            return x + self.fc(x)
+
+    pruner = RealPruner(PruningConfig(method="structured_l2", amount=0.3))
+    result = pruner.prune(Residual(), torch.randn(1, 10))
+    assert not result.success
+    assert "nn.Sequential" in result.error
+
+    # A BatchNorm inside an otherwise-valid Sequential must also be rejected —
+    # its per-channel parameters would need trimming too, which this
+    # implementation does not attempt.
+    model = torch.nn.Sequential(torch.nn.Linear(100, 50), torch.nn.BatchNorm1d(50), torch.nn.Linear(50, 10))
+    result = pruner.prune(model, torch.randn(4, 100))
+    assert not result.success
+    assert "BatchNorm1d" in result.error
+
+
+def test_unstructured_prune_raises():
+    torch = pytest.importorskip("torch")
+    from meta_optimizer.amazon_robotics import PruningConfig, RealPruner
+
+    pruner = RealPruner(PruningConfig(method="unstructured_l1", amount=0.3))
+    model = torch.nn.Sequential(torch.nn.Linear(100, 50), torch.nn.Linear(50, 10))
+    result = pruner.prune(model, torch.randn(4, 100))
+    assert not result.success
+    assert "sparsity" in result.error
+
+
 def test_quantizer_static_int8():
     torch = pytest.importorskip("torch")
     pytest.importorskip("torchao")
