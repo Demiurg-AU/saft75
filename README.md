@@ -21,8 +21,8 @@
 - **REAL structured pruning** — physical channel removal (not masking),
   generalized to nested CNN architectures (BatchNorm, depthwise conv)
 - Optional post-pruning fine-tuning on Imagenette2-160
-- Target: 3-5x inference speedup (benchmark pending)
-- Target: 4-10x memory reduction (benchmark pending)
+- Target: 3-5x inference speedup — Не достигнуто, см. REPORT.md
+- Target: 4-10x memory reduction — Не достигнуто, см. REPORT.md
 - ONNX/TensorRT export
 - Designed for edge deployment (INT8 + ONNX export)
 
@@ -177,9 +177,9 @@ print(result['optimization_results'])
 - **Temporal queries** — "when did we last optimize X?"
 
 ### Real Optimization
-- Target: 3-5x inference speedup (benchmark pending)
-- Target: 4-10x memory reduction (benchmark pending)
-- Target: <3% accuracy drop (validation harness pending)
+- Target: 3-5x inference speedup — Не достигнуто, см. REPORT.md
+- Target: 4-10x memory reduction — Не достигнуто, см. REPORT.md
+- Target: <3% accuracy drop — Не достигнуто (как совместное условие со сжатием/ускорением), см. REPORT.md
 - **<10ms latency target** (edge deployment)
 - **<100MB size target** (edge deployment)
 
@@ -286,4 +286,4 @@ print(f"Migrated {migration_stats['lessons']} lessons")
 ---
 
 **Version:** 7.0.0
-**Status:** Alpha — packaging and CI smoke tests in place, benchmarks pending
+**Status:** Alpha — packaging and CI smoke tests in place; real E1/E2 benchmark run completed, see REPORT.md (headline compression/speedup targets not met; accuracy gate passed individually by most strategies, not as a combined gate by any)
